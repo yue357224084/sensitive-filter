@@ -113,6 +113,7 @@ SF_UPSTREAM=https://your-upstream/v1 bun codex/proxy.mjs
 | `SF_PROXY_PORT` | Codex 代理监听端口 | 3141 |
 | `SF_PROXY_HOST` | Codex 代理监听地址 | 全部接口 |
 | `SF_UPSTREAM` | Codex 代理转发上游 | OpenAI 官方 |
+| `SF_PROXY_DEBUG=1` | Codex 代理调试日志（掩码前/后请求体、还原前/后响应，含明文，仅本地排障） | 关 |
 
 映射文件为 `sensitive_filter_map_<sha8>.json`（`{source_sha256, tokens}` 双向字典，仅存本地）。插件与 CLI 须指向**同一目录**才能互相还原（插件用 `SF_MAP_DIR`，CLI 用 `--map-out`）。
 
