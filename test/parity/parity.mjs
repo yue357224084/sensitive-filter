@@ -2,12 +2,21 @@
 // parity: 对拍 py 与 mjs 的掩码输出。只输出结论与差异行号，不打印样本内容。
 // 用法: node test/parity/parity.mjs
 import { spawnSync } from "node:child_process"
-import { readFileSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..")
-const sample = readFileSync(path.join(root, "test", "parity", "samples.txt"), "utf8")
+const samplesPath = path.join(root, "test", "parity", "samples.txt")
+// 样本不入库（含 token 形态，会被 GitHub Push Protection 误报）：缺则现场生成
+if (!existsSync(samplesPath)) {
+  const g = spawnSync("python", [path.join(root, "test", "parity", "gen_samples.py")], { encoding: "utf8", timeout: 120000 })
+  if (g.status !== 0 || !existsSync(samplesPath)) {
+    console.log(`PARITY_ERR 生成 samples.txt 失败: ${g.error || (g.stderr || "").slice(0, 200) || "unknown"}`)
+    process.exit(1)
+  }
+}
+const sample = readFileSync(samplesPath, "utf8")
 
 function run(cmd, args) {
   const r = spawnSync(cmd, args, { input: sample, encoding: "utf8", timeout: 120000 })
