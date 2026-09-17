@@ -107,6 +107,8 @@ cp plugin/sensitive-filter.ts ~/.config/opencode/plugins/
 
 配置来源优先级：**程序同目录 `.env` > 系统环境变量**（两者都配置时以 `.env` 为准）。`.env` 支持 `KEY=VALUE`、`export KEY=VALUE`、`#` 注释、引号包裹值；文件不存在则静默跳过。各程序读取自身所在目录：CLI/映射核心读仓库根的 `.env`，opencode 插件读插件文件所在目录（全局部署时即 `~/.config/opencode/plugins/.env`），Codex 代理读 `codex/.env`（proxy 还会先加载被复用核心所在目录的 `.env`，`codex/.env` 后加载、优先生效）。
 
+仓库根提供 `.env` 模板：列出全部变量与默认值（本插件 4 项 + Codex 代理 3 项 `SF_PROXY_PORT` / `SF_PROXY_HOST` / `SF_UPSTREAM`，默认 3141 / 全部接口 / OpenAI 官方），**默认整份注释**——不改变行为、不影响系统环境变量；取消注释某行即启用（按上面的优先级覆盖系统环境变量）。注意启用行也会覆盖脚本/测试注入的同名变量，仓库自带测试请在模板保持注释状态下运行。
+
 已知限制：会话标题生成调用不过插件（opencode issue #46115），首条消息可能明文到达标题模型；如需规避设 `"agent": { "title": { "disable": true } }`。
 
 设置环境变量 / Setting env vars：
