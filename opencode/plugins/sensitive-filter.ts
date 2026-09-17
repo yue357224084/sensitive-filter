@@ -19,6 +19,7 @@ function mapDir(): string {
   return dir
 }
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -404,6 +405,7 @@ function saveMap(mapping: Record<string, string>, maskedText: string): string {
   const bidir: Record<string, string> = { ...mapping }
   for (const [k, v] of Object.entries(mapping)) bidir[v] = k
   writeFileSync(p, JSON.stringify({ source_sha256: digest, tokens: bidir }), "utf8")
+  try { chmodSync(p, 0o600) } catch { /* 内容含明文真值；默认目录是 tmpdir，Linux 上 /tmp 全局可读。不支持则忽略 */ }
   sweepMaps()  // 写后清理：保证目录内文件数不超过 SF_MAP_KEEP
   return p
 }

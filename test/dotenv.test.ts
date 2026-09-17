@@ -61,13 +61,20 @@ function startMock() {
   return { bodies, url: "http://" + HOST + ":" + server.port, stop: () => server.stop(true) }
 }
 
-async function ping(url: string, proc: Bun.Subprocess, tries = 100) {
+// 起代理并读回真实监听地址：端口由内核分配（SF_PROXY_PORT=0），从启动日志解析，避免"抢占-释放"端口竞态
+async function listenUrl(proc: Bun.Subprocess, tries = 100) {
+  let log = ""
+  ;(async () => {
+    const td = new TextDecoder()
+    try { for await (const c of proc.stderr as ReadableStream<Uint8Array>) log += td.decode(c) } catch {}
+  })()
   for (let i = 0; i < tries; i++) {
-    if (proc.exitCode != null) throw new Error("proxy exited early: " + proc.exitCode)
-    try { await fetch(url + "/ping"); return } catch { /* 未就绪 */ }
+    if (proc.exitCode != null) throw new Error("proxy exited early: " + log)
+    const m = /listening on (http:\/\/\S+)/.exec(log)
+    if (m) return m[1]
     await Bun.sleep(50)
   }
-  throw new Error("proxy not ready")
+  throw new Error("proxy not ready: " + log)
 }
 
 // 起代理并发一个请求，返回 mock 收到的 body
@@ -77,21 +84,14 @@ async function probeProxy(opts: {
   sysEnv: Record<string, string>
   body: string
 }) {
-  let port = 0
-  {
-    const probe = Bun.serve({ hostname: HOST, port: 0, fetch: () => new Response("x") })
-    port = probe.port
-    probe.stop(true)
-  }
-  const proxyUrl = "http://" + HOST + ":" + port
-  // 端口必须传给子进程（系统 env 方式）；无 .env 时否则 proxy 落到默认 3141 撞占用
+  // 端口必须传给子进程（系统 env 方式）；0 = 内核分配，真实端口从启动日志读回
   const proc = Bun.spawn(["bun", "codex/proxy.mjs"], {
     cwd: opts.dir,
-    env: cleanEnv({ ...opts.sysEnv, SF_PROXY_PORT: String(port), SF_PROXY_HOST: HOST }),
+    env: cleanEnv({ ...opts.sysEnv, SF_PROXY_PORT: "0", SF_PROXY_HOST: HOST }),
     stdout: "pipe", stderr: "pipe",
   })
   procs.push(proc)
-  await ping(proxyUrl, proc)
+  const proxyUrl = await listenUrl(proc)
   const res = await fetch(proxyUrl + "/v1/responses", {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ input: opts.body }),
@@ -157,16 +157,13 @@ describe("dotenv 注入（.env 优先于系统环境变量）", () => {
       "SF_SKIP=\"phone\"\n",
       "SF_PROXY_PORT=\nSF_PROXY_HOST=" + HOST + "\nSF_UPSTREAM=" + mock.url + "\nSF_SKIP=ipv4\n",
     )
-    // 端口占位探测后再回填（.env 需具体数字）
-    const probe = Bun.serve({ hostname: HOST, port: 0, fetch: () => new Response("x") })
-    const port = probe.port
-    probe.stop(true)
+    // 端口 0 = 内核分配（.env 需具体值，0 合法），真实端口从启动日志读回
     writeFileSync(join(d, "codex", ".env"),
-      "SF_PROXY_HOST=" + HOST + "\nSF_PROXY_PORT=" + port + "\nSF_UPSTREAM=" + mock.url + "\nSF_SKIP=ipv4\n", "utf8")
-    const proxyUrl = "http://" + HOST + ":" + port
+      "SF_PROXY_HOST=" + HOST + "\nSF_PROXY_PORT=0\nSF_UPSTREAM=" + mock.url + "\nSF_SKIP=ipv4\n", "utf8")
     const proc = Bun.spawn(["bun", "codex/proxy.mjs"], { cwd: d, env: cleanEnv(), stdout: "pipe", stderr: "pipe" })
     procs.push(proc)
-    await ping(proxyUrl, proc)
+    const proxyUrl = await listenUrl(proc)
+    expect(Number(new URL(proxyUrl).port)).not.toBe(3141) // 端口确实来自 codex/.env（0 → 随机分配），而非默认 3141
     const res = await fetch(proxyUrl + "/v1/responses", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ input: SAMPLE }),

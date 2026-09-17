@@ -270,6 +270,10 @@ def save_map(mapping: dict, masked_text: str, map_out: str | None) -> Path:
         bidir[v] = k
     p.write_text(json.dumps({"source_sha256": digest, "tokens": bidir},
                             ensure_ascii=False), encoding="utf-8")
+    try:
+        os.chmod(p, 0o600)  # 内容含明文真值；默认目录是 tmpdir，Linux 上 /tmp 全局可读
+    except OSError:
+        pass  # Windows 等不支持时忽略（chmod 仅切只读位，0o600 含写位=no-op）
     if not map_out:
         _sweep_maps()  # 写后清理：保证目录内文件数不超过 SF_MAP_KEEP
     return p

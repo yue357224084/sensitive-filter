@@ -3,7 +3,7 @@
 // 断言：出站掩码 + instructions 注入 / 确定性编号 / SSE 跨 chunk 拆分还原 / JSON 递归还原 / SF_SKIP。
 // 注意：占位符一律运行时拼接（T 助手 / 字符串分段），源码不写字面真值，注释只用 [SECRET_n] 形（无数字）。
 import { afterEach, describe, expect, test } from "bun:test"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createHash } from "node:crypto"
@@ -32,14 +32,6 @@ function writeMap(dir, pairs) {
   }), "utf8")
 }
 
-// 找一个空闲端口：先占 port 0 再释放（竞态窗口极小，测试可接受）
-function freePort() {
-  const s = Bun.serve({ hostname: HOST, port: 0, fetch: () => new Response("x") })
-  const p = s.port
-  s.stop(true)
-  return p
-}
-
 let procs = []
 let maps = []
 function cleanup() {
@@ -50,22 +42,31 @@ function cleanup() {
 }
 afterEach(cleanup)
 
-async function waitReady(url, proc) {
-  for (let i = 0; i < 120; i++) {
-    if (proc.exitCode != null) throw new Error("proxy exited early")
-    try { await fetch(url + "/ping"); return } catch { /* 未就绪，重试 */ }
-    await Bun.sleep(50)
-  }
-  throw new Error("proxy not ready in time")
+// 子进程干净 env：剥离继承来的 SF_*（本机 .env 会被 bun 自动加载进测试进程，防其泄漏到子进程）
+function cleanEnv(extra) {
+  const env = {}
+  for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !k.startsWith("SF_")) env[k] = v
+  return { ...env, ...extra }
 }
 
+// 临时树：复刻 sensitive-filter.mjs + codex/proxy.mjs（相对 import 成立），让代理读不到仓库根的 .env
+function scaffoldProxy() {
+  const d = mkdtempSync(join(tmpdir(), "sf_proxy_tree_"))
+  maps.push(d)
+  cpSync(join(ROOT, "sensitive-filter.mjs"), join(d, "sensitive-filter.mjs"))
+  mkdirSync(join(d, "codex"))
+  cpSync(PROXY, join(d, "codex", "proxy.mjs"))
+  return d
+}
+
+// 起代理：临时树隔离环境；端口由内核分配（SF_PROXY_PORT=0）后从启动日志读回，避免"抢占-释放"端口竞态
 function startProxy(upstreamUrl, env = {}) {
   const mapDir = mkdtempSync(join(tmpdir(), "sf_proxy_test_"))
   maps.push(mapDir)
-  const port = freePort()
-  const proc = Bun.spawn([process.execPath, PROXY], {
-    cwd: ROOT,
-    env: { ...process.env, SF_PROXY_HOST: HOST, SF_PROXY_PORT: String(port), SF_UPSTREAM: upstreamUrl, SF_MAP_DIR: mapDir, ...env },
+  const tree = scaffoldProxy()
+  const proc = Bun.spawn([process.execPath, join(tree, "codex", "proxy.mjs")], {
+    cwd: tree,
+    env: cleanEnv({ SF_PROXY_HOST: HOST, SF_PROXY_PORT: "0", SF_UPSTREAM: upstreamUrl, SF_MAP_DIR: mapDir, ...env }),
     stdout: "pipe",
     stderr: "pipe",
   })
@@ -75,7 +76,15 @@ function startProxy(upstreamUrl, env = {}) {
     const td = new TextDecoder()
     try { for await (const chunk of proc.stderr) errLog.push(td.decode(chunk)) } catch {}
   })()
-  return { url: `http://${HOST}:${port}`, mapDir, getErr: () => errLog.join("") }
+  return (async () => {
+    for (let i = 0; i < 120; i++) {
+      if (proc.exitCode != null) throw new Error("proxy exited early: " + errLog.join(""))
+      const m = /listening on (http:\/\/\S+)/.exec(errLog.join(""))
+      if (m) return { url: m[1], mapDir, getErr: () => errLog.join("") }
+      await Bun.sleep(50)
+    }
+    throw new Error("proxy not ready in time: " + errLog.join(""))
+  })()
 }
 
 // mock 上游：记录收到的请求体，按场景返回 SSE / JSON
@@ -97,8 +106,7 @@ function startMock(onRequest) {
 describe("codex proxy", () => {
   test("(a) 出站掩码 + instructions 注入", async () => {
     const mock = startMock(() => Response.json({ ok: true }))
-    const proxy = startProxy(mock.url)
-    await waitReady(proxy.url, procs[procs.length - 1])
+    const proxy = await startProxy(mock.url)
 
     const res = await fetch(proxy.url + "/v1/responses", {
       method: "POST",
@@ -132,8 +140,7 @@ describe("codex proxy", () => {
 
   test("(b) 同值二次请求占位符编号不变（确定性）", async () => {
     const mock = startMock(() => Response.json({ ok: true }))
-    const proxy = startProxy(mock.url)
-    await waitReady(proxy.url, procs[procs.length - 1])
+    const proxy = await startProxy(mock.url)
 
     const send = async (k) => {
       await fetch(proxy.url + "/v1/responses", {
@@ -166,9 +173,8 @@ describe("codex proxy", () => {
       })
       return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })
     })
-    const proxy = startProxy(mock.url)
+    const proxy = await startProxy(mock.url)
     writeMap(proxy.mapDir, [[T("SECRET", 1), SSN_VAL]])
-    await waitReady(proxy.url, procs[procs.length - 1])
 
     const res = await fetch(proxy.url + "/v1/responses", {
       method: "POST",
@@ -190,9 +196,8 @@ describe("codex proxy", () => {
         meta: { nested: { deep: "token " + T("SECRET", 1) } },
         untouched: "[" + "SECRET" + "_99] 不在映射中原样保留",
       }, { status: 200, headers: { "content-type": "application/json" } }))
-    const proxy = startProxy(mock.url)
+    const proxy = await startProxy(mock.url)
     writeMap(proxy.mapDir, [[T("SECRET", 1), SSN_VAL], [T("PHONE", 1), REAL_PHONE]])
-    await waitReady(proxy.url, procs[procs.length - 1])
 
     const res = await fetch(proxy.url + "/v1/responses", {
       method: "POST",
@@ -208,8 +213,7 @@ describe("codex proxy", () => {
 
   test("(e) SF_SKIP=secret 时对应值不被掩", async () => {
     const mock = startMock(() => Response.json({ ok: true }))
-    const proxy = startProxy(mock.url, { SF_SKIP: "secret" })
-    await waitReady(proxy.url, procs[procs.length - 1])
+    const proxy = await startProxy(mock.url, { SF_SKIP: "secret" })
 
     const res = await fetch(proxy.url + "/v1/responses", {
       method: "POST",
@@ -226,8 +230,7 @@ describe("codex proxy", () => {
   test("(f) SF_PROXY_DEBUG=1：常规日志带 mask/restore 计数，debug 输出掩码前后与还原前后", async () => {
     // mock 回显收到的（已掩码）body：还原层应把占位符还原回真值 → restore>0
     const mock = startMock((raw) => Response.json(JSON.parse(raw)))
-    const proxy = startProxy(mock.url, { SF_PROXY_DEBUG: "1" })
-    await waitReady(proxy.url, procs[procs.length - 1])
+    const proxy = await startProxy(mock.url, { SF_PROXY_DEBUG: "1" })
 
     const res = await fetch(proxy.url + "/v1/responses", {
       method: "POST",
