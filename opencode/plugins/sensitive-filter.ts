@@ -421,12 +421,23 @@ function enabledSet(): Set<string> {
 }
 
 // 按 sess.taken spans 重建原文并分配全局唯一编号；不用字符串 replace（会误伤文本里已有的旧字面 token）
-function renumber(sess: Session, original: string): { out: string; mapping: Record<string, string> } {
+// boundaries：各 slot 在 original 中的区间（拼接分隔符不在任何区间内）。可跨行的规则（PEM、JSON
+// 数组值等）会把 slot 间分隔符整体吞进 span → 拆回时分段数错乱触发 fail-closed 误阻断。传
+// boundaries 时把跨界 span 裁到各 slot 区间内：分隔符必然存活，各子区间作为独立值掩码/映射/还原
+// （还原语义为子区间真值，不会还原出跨 slot 拼接值）。
+function renumber(sess: Session, original: string, boundaries?: Array<[number, number]>): { out: string; mapping: Record<string, string> } {
   const { tok2val, val2tok, maxByCat: base } = scanMaps()
   const newMapping: Record<string, string> = {}
   const assigned: Record<string, string> = {}  // 本次批量内 同值同号：sess.taken 每个 span 一条记录，
   // 若逐个 span 分配编号，同一值出现 N 次会拿到 N 个只剩最后一个进映射的编号 → 模型看到的前 N-1 个编号无映射可还原
-  const segs = sess.taken.map(([s, e]) => {
+  const spans: Array<[number, number, string | undefined]> = sess.taken.flatMap(([s, e]) => {
+    const oldTok = sess.mapping[original.slice(s, e)]
+    if (!boundaries) return [[s, e, oldTok]] as Array<[number, number, string | undefined]>
+    return boundaries
+      .filter(([bs, be]) => bs < e && s < be)  // 与该 slot 区间相交的子区间（不含区间外的分隔符）
+      .map(([bs, be]) => [Math.max(s, bs), Math.min(e, be), oldTok] as [number, number, string | undefined])
+  })
+  const segs = spans.map(([s, e, oldTok]) => {
     const val = original.slice(s, e)
     let newTok = assigned[val]
     if (!newTok) {
@@ -435,8 +446,7 @@ function renumber(sess: Session, original: string): { out: string; mapping: Reco
       if (cand && tok2val.get(cand) === val) newTok = cand  // 反向一致才复用，防跨文件歧义
     }
     if (!newTok) {
-      const oldTok = sess.mapping[val]
-      const mm = /^\[([A-Z][A-Z0-9]*)_(\d+)\]$/.exec(oldTok)  // 类别名可含数字（IPV4）
+      const mm = /^\[([A-Z][A-Z0-9]*)_(\d+)\]$/.exec(oldTok || "")  // 类别名可含数字（IPV4）
       newTok = oldTok
       if (mm) {
         const cat = mm[1]
@@ -460,11 +470,16 @@ function maskBatch(slots: Slot[], sep: string = makeSep()): void {
   if (!slots.length) return
   // sep 两端必须带换行：避免相邻 slot 内容粘成同一个词导致 \b 边界失效
   const glue = "\n" + sep + "\n"
-  const joined = slots.map((s) => s.get()).join(glue)
+  const parts = slots.map((s) => s.get())
+  const joined = parts.join(glue)
+  // 各 slot 在 joined 中的区间（分隔符不在其中）——可跨行规则（PEM/JSON 数组值）误吞分隔符时供 renumber 裁界
+  const boundaries: Array<[number, number]> = []
+  let off = 0
+  for (const p of parts) { boundaries.push([off, off + p.length]); off += p.length + glue.length }
   const { sess } = maskText(joined, enabledSet(), true)
   // 插件层重编号到全局唯一（修 system/messages 同号冲突）；maskText 的 out 丢弃，
   // 由 renumber 从原文 + taken spans 重建（避免字符串 replace 误伤旧字面 token）
-  const { out, mapping } = renumber(sess, joined)
+  const { out, mapping } = renumber(sess, joined, boundaries)
   if (Object.keys(mapping).length) saveMap(mapping, out)
   const pieces = out.split(glue)
   if (pieces.length !== slots.length) {
