@@ -222,4 +222,29 @@ describe("codex proxy", () => {
     expect(got).not.toContain(REAL_PHONE) // phone 仍掩
     mock.stop()
   })
+
+  test("(f) SF_PROXY_DEBUG=1：常规日志带 mask/restore 计数，debug 输出掩码前后与还原前后", async () => {
+    // mock 回显收到的（已掩码）body：还原层应把占位符还原回真值 → restore>0
+    const mock = startMock((raw) => Response.json(JSON.parse(raw)))
+    const proxy = startProxy(mock.url, { SF_PROXY_DEBUG: "1" })
+    await waitReady(proxy.url, procs[procs.length - 1])
+
+    const res = await fetch(proxy.url + "/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ input: [{ role: "user", content: [{ type: "input_text", text: "key=" + SK_KEY + " phone=" + REAL_PHONE }] }] }),
+    })
+    expect(res.status).toBe(200)
+    const sent = JSON.parse(mock.bodies[0]).input[0].content[0].text
+    expect(sent).not.toContain(REAL_PHONE) // 出站已掩
+    mock.stop()
+    const err = proxy.getErr()
+    expect(err).toContain("[SF-proxy:debug] req.body(before)") // 掩码前原文
+    expect(err).toContain(REAL_PHONE) // before 里有明文（debug 设计如此）
+    expect(err).toContain("[SF-proxy:debug] req.body(after)") // 掩码后实际发往上游
+    expect(err).toContain("[SF-proxy:debug] res.json(before)")
+    expect(err).toContain("[SF-proxy:debug] res.json(after)")
+    expect(err).toMatch(/mask=[1-9]/) // 常规日志：掩了 1+ 处
+    expect(err).toMatch(/restore=[1-9]/) // 常规日志：还原了 1+ 处
+  })
 })

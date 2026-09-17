@@ -9,6 +9,8 @@
 //   SF_UPSTREAM   上游 base_url（默认 https://api.openai.com/v1）
 //   SF_MAP_DIR    映射目录（默认 os.tmpdir()，与 CLI --restore 双向互操作）
 //   SF_OFF=1      代理直接退出        SF_ONLY / SF_SKIP 沿用 enabledSet() 语义
+//   SF_PROXY_DEBUG=1（或启动参数 --debug）
+//                 debug 日志：输出掩码前/后的请求体、响应还原前/后原文——含敏感明文，仅本地排障，勿外传日志
 import { readdirSync, readFileSync, statSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -41,6 +43,8 @@ if (process.env.SF_OFF === "1") {
 const MAP_PREFIX = "sensitive_filter_map_"
 const SF_INSTRUCTION =
   "[sensitive-filter] 对话里的 [SECRET_n]/[IDCARD_n]/[PHONE_n]/[BANKCARD_n]/[EMAIL_n]/[IPV4_n] 是真实值的本地脱敏占位符：请原样保留引用、不要改写格式、不要编造原值；在 bash/写文件等工具参数里引用时也保持原样（工具执行前会自动还原为真值）。"
+
+const DEBUG = process.env.SF_PROXY_DEBUG === "1" || process.argv.includes("--debug")
 
 const CAT_RE = /^\[([A-Z][A-Z0-9]*)_(\d+)\]$/
 const TOKEN_STRIP = /\[(?:SECRET|IDCARD|PHONE|BANKCARD|EMAIL|IPV4)_\d+\]/g
@@ -217,7 +221,10 @@ async function* sseRestoreStream(body, counts) {
       const buf = Buffer.concat([tail, Buffer.isBuffer(value) ? value : Buffer.from(value)])
       const { safe, tail: t } = splitTail(buf)
       tail = t
-      if (safe.length) yield restoreText(safe.toString("utf8"), counts)
+      if (safe.length) {
+        if (DEBUG) console.error("[SF-proxy:debug] sse.raw> " + safe.toString("utf8"))
+        yield restoreText(safe.toString("utf8"), counts)
+      }
     }
   } catch (e) {
     console.error(`[SF-proxy] 入站 SSE 处理失败，透传剩余流: ${e && (e.message || e)}`)
@@ -230,9 +237,13 @@ async function* sseRestoreStream(body, counts) {
     return
   }
   if (tail.length) yield restoreText(tail.toString("utf8"), counts) // 流结束：冲刷尾缓冲
+  if (DEBUG) console.error(`[SF-proxy:debug] sse.done restore=${counts.restore}`)
 }
 
 // ---- 转发与装配 ----
+
+// 每请求掩码/还原计数（WeakMap 挂 Response 供访问日志读取）
+const RES_INFO = new WeakMap()
 
 function failClosed(status, msg, e) {
   console.error(`[SF-proxy] ${msg}: ${e && (e.message || e)}`)
@@ -261,17 +272,19 @@ async function handle(req) {
   const ct = (req.headers.get("content-type") || "").toLowerCase()
   if ((method === "POST" || method === "PUT" || method === "PATCH") && ct.includes("json")) {
     const raw = await req.text()
+    if (DEBUG && raw.trim()) console.error("[SF-proxy:debug] req.body(before)\n" + raw) // 掩码前明文
     if (raw.trim()) {
       let parsed
       try { parsed = JSON.parse(raw) } catch (e) {
-        return failClosed(400, "请求体 JSON 解析失败，未转发", e)
+        const r = failClosed(400, "请求体 JSON 解析失败，未转发", e); RES_INFO.set(r, { masked: 0, restore: 0 }); return r
       }
       try {
         maskedCount = maskRequestBody(parsed)
       } catch (e) {
-        return failClosed(502, "出站掩码失败，未转发", e) // fail-closed：掩码异常不发送
+        const r = failClosed(502, "出站掩码失败，未转发", e); RES_INFO.set(r, { masked: maskedCount, restore: 0 }); return r // fail-closed：掩码异常不发送
       }
       bodyOut = JSON.stringify(parsed)
+      if (DEBUG) console.error("[SF-proxy:debug] req.body(after)\n" + bodyOut) // 掩码后实际发往上游
     } else bodyOut = raw
   } else {
     bodyOut = await req.arrayBuffer() // 非 JSON（GET/二进制等）原样透传
@@ -285,7 +298,7 @@ async function handle(req) {
       body: method === "GET" || method === "HEAD" ? undefined : bodyOut,
     })
   } catch (e) {
-    return failClosed(502, `上游连接失败: ${target.split("?")[0]}`, e)
+    const r = failClosed(502, `上游连接失败: ${target.split("?")[0]}`, e); RES_INFO.set(r, { masked: maskedCount, restore: 0 }); return r
   }
 
   const resHeaders = new Headers()
@@ -296,7 +309,9 @@ async function handle(req) {
   const ctype = (upRes.headers.get("content-type") || "").toLowerCase()
   if (ctype.includes("text/event-stream")) {
     const counts = { restore: 0 }
-    return new Response(sseRestoreStream(upRes.body, counts), { status: upRes.status, headers: resHeaders })
+    const r = new Response(sseRestoreStream(upRes.body, counts), { status: upRes.status, headers: resHeaders })
+    RES_INFO.set(r, { masked: maskedCount, restore: "stream" }) // restore 数在流结束后由 debug 汇总行输出
+    return r
   }
   if (ctype.includes("json")) {
     const text = await upRes.text()
@@ -304,9 +319,17 @@ async function handle(req) {
     try { data = JSON.parse(text) } catch { return new Response(text, { status: upRes.status, headers: resHeaders }) }
     const counts = { restore: 0 }
     data = deepRestore(data, counts)
-    return Response.json(data, { status: upRes.status, headers: resHeaders })
+    if (DEBUG) {
+      console.error("[SF-proxy:debug] res.json(before)\n" + text)
+      console.error("[SF-proxy:debug] res.json(after)\n" + JSON.stringify(data))
+    }
+    const r = Response.json(data, { status: upRes.status, headers: resHeaders })
+    RES_INFO.set(r, { masked: maskedCount, restore: counts.restore })
+    return r
   }
-  return new Response(upRes.body, { status: upRes.status, headers: resHeaders })
+  const r0 = new Response(upRes.body, { status: upRes.status, headers: resHeaders })
+  RES_INFO.set(r0, { masked: maskedCount, restore: 0 })
+  return r0
 }
 
 function slog(method, pathname, status, extra) {
@@ -323,7 +346,8 @@ const server = Bun.serve({
     const t0 = Date.now()
     try {
       const res = await handle(req)
-      slog(method, pathname, res.status, `(${Date.now() - t0}ms)`)
+      const info = RES_INFO.get(res)
+      slog(method, pathname, res.status, `(${Date.now() - t0}ms) mask=${info?.masked ?? 0} restore=${info?.restore ?? 0}`)
       return res
     } catch (e) {
       slog(method, pathname, 500)
