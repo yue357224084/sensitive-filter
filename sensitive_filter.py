@@ -22,6 +22,33 @@ import tempfile
 import time
 from pathlib import Path
 
+
+# ---------------------------------------------------------------- .env 注入（脚本同目录；.env 值优先于系统环境变量）
+def load_dotenv() -> None:
+    """支持 KEY=VALUE / export KEY=VALUE / # 注释 / 引号包裹值；.env 不存在则静默跳过。"""
+    p = Path(__file__).resolve().parent / ".env"
+    try:
+        txt = p.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in txt.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("export "):
+            s = s[7:]
+        if "=" not in s:
+            continue
+        k, v = s.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        os.environ[k] = v
+
+
+load_dotenv()
+
 # ---------------------------------------------------------------- 校验算法
 
 _CN_ID_W = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]

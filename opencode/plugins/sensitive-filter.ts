@@ -29,8 +29,27 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { createHash } from "node:crypto"
+
+// ---------------------------------------------------------------- .env 注入（脚本同目录；.env 值优先于系统环境变量）
+// 与 sensitive-filter.mjs / codex/proxy.mjs 同款实现；.env 不存在则静默跳过。
+function loadDotEnv(): void {
+  let txt = ""
+  try { txt = readFileSync(join(dirname(fileURLToPath(import.meta.url)), ".env"), "utf8") } catch { return }
+  for (const line of txt.split(/\r?\n/)) {
+    let s = line.trim()
+    if (!s || s.startsWith("#")) continue
+    if (s.startsWith("export ")) s = s.slice(7)
+    const i = s.indexOf("=")
+    if (i <= 0) continue
+    let v = s.slice(i + 1).trim()
+    if (v.length >= 2 && (v[0] === '"' || v[0] === "'") && v[v.length - 1] === v[0]) v = v.slice(1, -1)
+    process.env[s.slice(0, i).trim()] = v
+  }
+}
+loadDotEnv()
 
 // 占位符形如 [SECRET_1] / [IPV4_3] ...
 const TOKEN_HAS = /\[(?:SECRET|IDCARD|PHONE|BANKCARD|EMAIL|IPV4)_\d+\]/

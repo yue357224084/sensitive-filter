@@ -6,13 +6,32 @@
 // 用法: bun codex/proxy.mjs
 // 环境变量:
 //   SF_PROXY_PORT 监听端口（默认 3141）   SF_PROXY_HOST 监听地址（默认全部接口；部署时设为目标内网 IP）
-//   SF_UPSTREAM   上游 base_url（默认 https://api.openai.com/v1，实际部署 https://anyrouter.top/v1）
+//   SF_UPSTREAM   上游 base_url（默认 https://api.openai.com/v1）
 //   SF_MAP_DIR    映射目录（默认 os.tmpdir()，与 CLI --restore 双向互操作）
 //   SF_OFF=1      代理直接退出        SF_ONLY / SF_SKIP 沿用 enabledSet() 语义
 import { readdirSync, readFileSync, statSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { fileURLToPath } from "node:url"
 import { maskText, CATS, saveMap, enabledSet } from "../sensitive-filter.mjs"
+
+// ---------------------------------------------------------------- .env 注入（脚本同目录；.env 值优先于系统环境变量）
+// 必须在所有 SF_* 读取（含下方 SF_OFF 顶层检查与 enabledSet()）之前执行。
+function loadDotEnv() {
+  let txt = ""
+  try { txt = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), ".env"), "utf8") } catch { return }
+  for (const line of txt.split(/\r?\n/)) {
+    let s = line.trim()
+    if (!s || s.startsWith("#")) continue
+    if (s.startsWith("export ")) s = s.slice(7)
+    const i = s.indexOf("=")
+    if (i <= 0) continue
+    let v = s.slice(i + 1).trim()
+    if (v.length >= 2 && (v[0] === '"' || v[0] === "'") && v[v.length - 1] === v[0]) v = v.slice(1, -1)
+    process.env[s.slice(0, i).trim()] = v
+  }
+}
+loadDotEnv()
 
 if (process.env.SF_OFF === "1") {
   console.error("[SF-proxy] SF_OFF=1，代理不启动")

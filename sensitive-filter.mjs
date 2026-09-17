@@ -15,6 +15,25 @@ import {
 } from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { fileURLToPath } from "node:url"
+
+// ---------------------------------------------------------------- .env 注入（脚本同目录；.env 值优先于系统环境变量）
+// 支持格式：KEY=VALUE / export KEY=VALUE / # 注释 / 引号包裹值（去引号）。.env 不存在则静默跳过。
+function loadDotEnv() {
+  let txt = ""
+  try { txt = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), ".env"), "utf8") } catch { return }
+  for (const line of txt.split(/\r?\n/)) {
+    let s = line.trim()
+    if (!s || s.startsWith("#")) continue
+    if (s.startsWith("export ")) s = s.slice(7)
+    const i = s.indexOf("=")
+    if (i <= 0) continue
+    let v = s.slice(i + 1).trim()
+    if (v.length >= 2 && (v[0] === '"' || v[0] === "'") && v[v.length - 1] === v[0]) v = v.slice(1, -1)
+    process.env[s.slice(0, i).trim()] = v
+  }
+}
+loadDotEnv()
 
 // ---------------------------------------------------------------- 校验算法
 

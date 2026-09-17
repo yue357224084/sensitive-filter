@@ -105,6 +105,8 @@ cp plugin/sensitive-filter.ts ~/.config/opencode/plugins/
 | `SF_SKIP=类别` | 跳过指定类别（如排障时 `SF_SKIP=ipv4`） |
 | `SF_MAP_DIR=目录` | 映射文件目录（默认系统临时目录；与 CLI `--map-out` 指同一目录才可互操作还原） |
 
+配置来源优先级：**程序同目录 `.env` > 系统环境变量**（两者都配置时以 `.env` 为准）。`.env` 支持 `KEY=VALUE`、`export KEY=VALUE`、`#` 注释、引号包裹值；文件不存在则静默跳过。各程序读取自身所在目录：CLI/映射核心读仓库根的 `.env`，opencode 插件读插件文件所在目录（全局部署时即 `~/.config/opencode/plugins/.env`），Codex 代理读 `codex/.env`（proxy 还会先加载被复用核心所在目录的 `.env`，`codex/.env` 后加载、优先生效）。
+
 已知限制：会话标题生成调用不过插件（opencode issue #46115），首条消息可能明文到达标题模型；如需规避设 `"agent": { "title": { "disable": true } }`。
 
 设置环境变量 / Setting env vars：
