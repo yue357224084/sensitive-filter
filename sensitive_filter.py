@@ -2,7 +2,7 @@
 """sensitive-filter: 发给大模型前的本地敏感信息过滤（方案 A+C）。
 
 C 层（零依赖，默认）：正则 + 校验算法（身份证 mod-11、银行卡 Luhn），密钥/手机号/身份证/银行卡/邮箱/IPv4。
-gitleaks：已安装则补充扫描密钥格式，未安装自动跳过。
+gitleaks / betterleaks：已安装则补充扫描密钥格式（betterleaks 优先），未安装自动跳过。
 
 用法:
   python sensitive_filter.py [文件...]        # 脱敏文本 -> stdout，报告 -> stderr
@@ -160,20 +160,24 @@ def c_layer(text: str, sess: Session, enabled: set):
                 sess.take(s, e, cat, val)
 
 
-def _find_gitleaks() -> str | None:
-    exe = shutil.which("gitleaks")
-    if exe:
-        return exe
-    # winget 便携安装兜底路径(shell PATH 未刷新时生效)
-    p = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft/WinGet/Links/gitleaks.exe"
-    return str(p) if p.is_file() else None
+def _find_scanner() -> str | None:
+    for name in ("betterleaks", "gitleaks"):  # betterleaks 优先
+        exe = shutil.which(name)
+        if exe:
+            return exe
+        # winget 便携安装兜底路径(shell PATH 未刷新时生效)
+        p = Path(os.environ.get("LOCALAPPDATA", "")) / f"Microsoft/WinGet/Links/{name}.exe"
+        if p.is_file():
+            return str(p)
+    return None
 
 
-def gitleaks_layer(text: str, sess: Session):
-    """gitleaks 密钥规则补充扫描。未安装/失败仅提示，不阻断。"""
-    exe = _find_gitleaks()
+def scanner_layer(text: str, sess: Session):
+    """外部扫描器密钥规则补充（betterleaks 优先，回退 gitleaks）。未安装/失败仅提示，不阻断。"""
+    exe = _find_scanner()
     if not exe:
-        return "未安装(可选: winget install gitleaks)"
+        return "未安装(可选: betterleaks 或 gitleaks)"
+    scanner = "betterleaks" if "betterleaks" in exe.lower() else "gitleaks"
     tmpdir = Path(tempfile.mkdtemp(prefix="sfilter_gl_"))
     try:
         (tmpdir / "input.txt").write_text(text, encoding="utf-8")
@@ -187,13 +191,13 @@ def gitleaks_layer(text: str, sess: Session):
             leaks = json.loads(rep.read_text(encoding="utf-8"))
         taken = 0
         for leak in leaks:
-            val = (leak.get("Secret") or leak.get("Match") or "").strip()
+            val = (leak.get("Secret") or leak.get("secret") or leak.get("Match") or leak.get("match") or "").strip()
             if val:
                 idx = text.find(val)
                 if idx >= 0 and sess.free(idx, idx + len(val)):
                     sess.take(idx, idx + len(val), "secret", val)
                     taken += 1
-        return f"补掩 {taken}/{len(leaks)}" if leaks else "无命中"
+        return f"{scanner}: 补掩 {taken}/{len(leaks)}" if leaks else f"{scanner}: 无命中"
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         return f"跳过({type(exc).__name__})"
     finally:
@@ -205,7 +209,7 @@ def gitleaks_layer(text: str, sess: Session):
 def mask_text(text: str, enabled: set, use_gitleaks: bool):
     sess = Session()
     c_layer(text, sess, enabled)
-    gitleaks_note = gitleaks_layer(text, sess) if use_gitleaks else "禁用"
+    gitleaks_note = scanner_layer(text, sess) if use_gitleaks else "禁用"
     out = text
     for s, e, tok in sorted(((s, e, sess.mapping[text[s:e]]) for s, e in sess.taken),
                             key=lambda x: -x[0]):

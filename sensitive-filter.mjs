@@ -156,27 +156,31 @@ function cLayer(text, sess, enabled) {
   }
 }
 
-// ---------------------------------------------------------------- gitleaks 增强层
+// ---------------------------------------------------------------- 外部扫描器增强层（betterleaks 优先，回退 gitleaks）
 
-function findGitleaks() {
+function findScanner() {
+  const names = ["betterleaks", "gitleaks"]  // betterleaks 优先
   const exts = process.platform === "win32"
     ? (process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD").split(";")
     : [""]
   const cands = []
-  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
-    if (!dir) continue
-    for (const ext of exts) cands.push(path.join(dir, "gitleaks" + ext))
-  }
-  // winget 便携安装兜底路径(shell PATH 未刷新时生效)
-  if (process.env.LOCALAPPDATA) {
-    cands.push(path.join(process.env.LOCALAPPDATA, "Microsoft", "WinGet", "Links", "gitleaks.exe"))
+  for (const name of names) {
+    for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+      if (!dir) continue
+      for (const ext of exts) cands.push(path.join(dir, name + ext))
+    }
+    // winget 便携安装兜底路径(shell PATH 未刷新时生效)
+    if (process.env.LOCALAPPDATA) {
+      cands.push(path.join(process.env.LOCALAPPDATA, "Microsoft", "WinGet", "Links", name + ".exe"))
+    }
   }
   return cands.find((c) => existsSync(c)) || null
 }
 
-function gitleaksLayer(text, sess) {
-  const exe = findGitleaks()
-  if (!exe) return "未安装(可选: winget install gitleaks)"
+function scannerLayer(text, sess) {
+  const exe = findScanner()
+  if (!exe) return "未安装(可选: betterleaks 或 gitleaks)"
+  const scanner = /betterleaks/i.test(exe) ? "betterleaks" : "gitleaks"
   const dir = mkdtempSync(path.join(os.tmpdir(), "sfilter_gl_"))
   try {
     writeFileSync(path.join(dir, "input.txt"), text, "utf8")
@@ -194,7 +198,7 @@ function gitleaksLayer(text, sess) {
     }
     let taken = 0
     for (const leak of leaks) {
-      const val = (leak.Secret || leak.Match || "").toString().trim()
+      const val = (leak.Secret || leak.secret || leak.Match || leak.match || "").toString().trim()
       if (val) {
         const idx = text.indexOf(val)
         if (idx >= 0 && sess.free(idx, idx + val.length)) {
@@ -203,7 +207,7 @@ function gitleaksLayer(text, sess) {
         }
       }
     }
-    return leaks.length ? `补掩 ${taken}/${leaks.length}` : "无命中"
+    return leaks.length ? `${scanner}: 补掩 ${taken}/${leaks.length}` : `${scanner}: 无命中`
   } catch (e) {
     return `跳过(${(e && e.constructor && e.constructor.name) || "Error"})`
   } finally {
@@ -216,7 +220,7 @@ function gitleaksLayer(text, sess) {
 function maskText(text, enabled, useGitleaks) {
   const sess = new Session()
   cLayer(text, sess, enabled)
-  const gitleaksNote = useGitleaks ? gitleaksLayer(text, sess) : "禁用"
+  const gitleaksNote = useGitleaks ? scannerLayer(text, sess) : "禁用"
   let out = text
   const segs = sess.taken
     .map(([s, e]) => [s, e, sess.mapping[text.slice(s, e)]])

@@ -2,13 +2,11 @@
 
 发给大模型前的本地敏感信息过滤 / Local sensitive-info filter before sending to LLMs
 
-把日志/配置/代码/流量记录等内容发给云端大模型（或贴进上下文）**之前**，先在本地过一遍本工具。零依赖、秒级完成；装了 gitleaks 自动增强密钥识别。
+把日志/配置/代码/流量记录等内容发给云端大模型（或贴进上下文）**之前**，先在本地过一遍本工具。零依赖、秒级完成；装了 betterleaks 或 gitleaks 自动增强密钥识别（两者二选一，betterleaks 优先）。
 
-Run logs/config/code before pasting them into a cloud LLM (or your chat context). Zero dependencies, sub-second; gitleaks auto-enhances secret detection when installed.
+Run logs/config/code before pasting them into a cloud LLM (or your chat context). Zero dependencies, sub-second; betterleaks or gitleaks auto-enhances secret detection when installed (betterleaks takes precedence).
 
-## 功能 / Features
-
-脱敏 / Masking:
+## 脱敏 / Masking: 
 
 | 类别 Category | 规则 Rule |
 |---|---|
@@ -22,20 +20,6 @@ Run logs/config/code before pasting them into a cloud LLM (or your chat context)
 输出可逆：脱敏为 `[SECRET_2]`/`[IDCARD_1]`/`[PHONE_1]`/`[BANKCARD_1]`/`[EMAIL_1]`/`[IPV4_1]` 形占位符，映射文件仅存本地，LLM 返回后 `--restore` 回填。映射文件名与内容 sha256 绑定，防错配；超过上限自动清理（默认保留 5000 个，从最旧删）。
 
 Reversible: tokens like `[SECRET_2]`/`[IDCARD_1]`/`[PHONE_1]`/`[BANKCARD_1]`/`[EMAIL_1]`/`[IPV4_1]`; the mapping file stays local and `--restore` refills values after the LLM replies. Map filename is hash-bound to content; auto-cleaned by capacity (default keep 5000, oldest first).
-
-## 映射文件位置 / Map file location
-
-默认写在**系统临时目录**：`sensitive_filter_map_<sha8前8位>.json`（Windows 为 `%TEMP%`，如 `C:\Users\<USER>\AppData\Local\Temp\`；类 Unix 为 `$TMPDIR`）。
-
-三端覆盖方式：
-
-| 端 | 方式 |
-|---|---|
-| Python CLI | `--map-out <目录或文件路径>` |
-| Node CLI | `--map-out <目录或文件路径>` |
-| opencode 插件 | 环境变量 `SF_MAP_DIR=<目录>`（默认临时目录） |
-
-> 注意：若通过 `SF_MAP_DIR` / `--map-out` 改了目录，插件与 CLI 必须指向**同一目录**，插件的占位符才能被 CLI 的 `--restore` 还原（双向互操作）。插件会自动创建 `SF_MAP_DIR` 目录；创建失败（如权限问题）时按 fail-closed 阻断。
 
 ## 用法 / Usage
 
@@ -51,8 +35,6 @@ cat app.log | node sensitive-filter.mjs
 node sensitive-filter.mjs --selftest
 
 # 映射与还原 / map & restore
-
-```bash
 # 步骤 1: 脱敏，映射文件写到指定目录
 python sensitive_filter.py app.log --map-out ./maps
 # stdout = 脱敏文本（贴给 LLM），stderr = 报告
@@ -70,16 +52,15 @@ python sensitive_filter.py --restore llm_reply.txt --map ./maps/sensitive_filter
 
 # Node.js 等价版同样支持 --map-out / --restore / --map / --force
 node sensitive-filter.mjs --restore llm_reply.txt --map ./maps/sensitive_filter_map_xxxxxxxx.json
-```
 
 # 类别开关 / category switches
 python sensitive_filter.py 文件.txt --only phone,idcard
 node sensitive-filter.mjs 文件.txt --skip ipv4
 ```
 
-- stdout = 脱敏文本；stderr = 报告（计数、映射路径、gitleaks 状态，**永不显示原值**）
+- stdout = 脱敏文本；stderr = 报告（计数、映射路径、扫描器状态，**永不显示原值**）
 - 已是 `********` / `${VAR}` / `<TOKEN>` 形式的值不会二次处理
-- `--no-gitleaks` 禁用 gitleaks 补充层
+- `--no-gitleaks` 禁用外部扫描器补充层（betterleaks/gitleaks）
 
 
 ## 原理与部署 / Principle & Deployment
@@ -89,12 +70,17 @@ node sensitive-filter.mjs 文件.txt --skip ipv4
 ### opencode 插件
 
 ```bash
+# 全局部署（所有项目生效）
 mkdir -p ~/.config/opencode/plugins
 cp opencode/plugins/sensitive-filter.ts ~/.config/opencode/plugins/
+
+# 或项目级部署
+mkdir -p .opencode/plugins
+cp opencode/plugins/sensitive-filter.ts .opencode/plugins/
 # 重启 opencode 生效
 ```
 
-每次调用大模型前自动掩码全部消息与系统提示，工具执行前与回复展示前自动还原。核心正则层进程内联，无需 Python；gitleaks 可选增强（`Bun.which` 检测，未装自动跳过）。
+用法：装好后无需命令行调用——每次调用大模型前自动掩码全部消息与系统提示，工具执行前与回复展示前自动还原。开关与映射目录写在**插件自身目录**的 `.env`（如 `SF_MAP_DIR`/`SF_MAP_KEEP`）或系统环境变量（`.env` 优先）；若模型把占位符写进了文件，用 CLI `--restore`（必要时 `--force`）兜底还原。核心正则层进程内联，无需 Python；外部扫描器可选增强（betterleaks 优先、回退 gitleaks，未装自动跳过）。
 
 > 注意：会话标题生成调用不过插件（opencode issue #46115），首条消息可能明文到达标题模型；如需规避设 `"agent": { "title": { "disable": true } }`。
 
@@ -115,18 +101,20 @@ SF_UPSTREAM=https://your-upstream/v1 bun codex/proxy.mjs
 
 代理出站掩码 `instructions`/`input` + 注入占位符指令 + 确定性持久映射（与 CLI/插件互操作）；入站 SSE 跨 chunk 还原 + JSON 递归还原。
 
-## 开关 / Configuration
+## 开关配置 / Configuration  --均可在.env配置中修改
 
 | 变量 | 作用 | 默认 |
 |---|---|---|
 | `SF_OFF=1` | 全局停用 | — |
 | `SF_ONLY=类别` | 只启用指定类别 | 全部 |
 | `SF_SKIP=类别` | 跳过指定类别 | 无 |
-| `SF_MAP_DIR=目录` | 映射文件目录 | 系统临时目录 |
+| `SF_MAP_DIR=目录` | 映射文件目录（CLI 用 `--map-out`） | 系统临时目录 |
 | `SF_MAP_KEEP=数量` | 映射保留上限（从最旧清理） | 5000 |
 | `SF_PROXY_PORT` | Codex 代理监听端口 | 3141 |
 | `SF_PROXY_HOST` | Codex 代理监听地址 | 全部接口 |
 | `SF_UPSTREAM` | Codex 代理转发上游 | OpenAI 官方 |
+
+映射文件为 `sensitive_filter_map_<sha8>.json`（`{source_sha256, tokens}` 双向字典，仅存本地）。插件与 CLI 须指向**同一目录**才能互相还原（插件用 `SF_MAP_DIR`，CLI 用 `--map-out`）。
 
 配置优先级：同目录 `.env` > 系统环境变量。仓库根有 `.env` 模板（默认全注释，取消注释即生效）。各程序读自身所在目录的 `.env`。
 
@@ -135,7 +123,7 @@ SF_UPSTREAM=https://your-upstream/v1 bun codex/proxy.mjs
 | 层 Layer | 依赖 Dependency | 覆盖 Coverage |
 |---|---|---|
 | C 层（默认）regex layer | 无 / none | 密钥/连接串/Authorization 头/身份证/手机/银行卡/邮箱/IPv4 |
-| gitleaks | 本机已装 / installed | 200+ 密钥格式补充；未安装自动跳过 |
+| betterleaks / gitleaks | 自动检测（二选一） | 补充密钥/凭据格式识别；betterleaks 优先，未安装自动跳过 |
 
 ## 已知边界 / Known limits
 
@@ -152,43 +140,24 @@ SF_UPSTREAM=https://your-upstream/v1 bun codex/proxy.mjs
 
 English: To recognize Chinese names/addresses (semantic PII), optionally integrate GLiNER. Current version uses regex only; GLiNER integration is reserved for future work.
 
-## gitleaks 安装 / Installing gitleaks
+## 外部扫描器安装 / Installing scanner (betterleaks / gitleaks)
 
-gitleaks 是可选增强层（200+ 密钥格式），未安装时自动跳过，不影响核心功能。
+外部扫描器是可选增强层（几百种密钥/凭据格式），未安装时自动跳过，不影响核心功能。**两者只需装一个**：同时存在时优先用 betterleaks（gitleaks 原作者的继任实现，CLI 兼容）。
+- **betterleaks**   https://github.com/betterleaks/betterleaks
+- **gitleaks**  https://github.com/gitleaks/gitleaks/
 
-### Linux
+它的价值（实测结论）：
+- **厂商前缀长尾**：SaaS/云厂商 token 的 detector 由上游持续更新（`SG.`、`npm_`、`glsa_`、`.atlasv1.`、Slack webhook 等），规则维护外包给上游。
+- **熵启发式**：`generic-api-key`（关键词 + 高熵值）可抓无固定前缀的凭据——本工具为避免对话文本误报，主动不做熵检测。
+- **betterleaks 额外能力**：`validate` 联网校验（会把命中的候选 token 发往对应厂商 API 验真，隐私敏感场景勿用；本工具自身从不调用它）、prefilter、自定义配置。
+- **边界**：多数规则带熵阈值，hex/低熵字符集的真实厂商 token（dapi/PMAK/rubygems/NRAK- 等）与低熵关键词值会漏报——这类由本项目内置正则兜住；中文 PII、URL userinfo、PEM 等结构型规则为本项目独有。
 
-```bash
-# 方式 1: 下载 release 二进制
-wget https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks-linux-amd64 -O /usr/local/bin/gitleaks
-chmod +x /usr/local/bin/gitleaks
-
-# 方式 2: Homebrew
-brew install gitleaks
-
-# 验证
-gitleaks version
-```
-
-### Windows
-
-```powershell
-# 方式 1: winget
-winget install Gitleaks.Gitleaks
-
-# 方式 2: scoop
-scoop install gitleaks
-
-# 方式 3: choco
-choco install gitleaks
-
-# 验证
-gitleaks version
-```
 
 ## Credits / 致谢
 
-- **[@rehydra/opencode](https://github.com/rehydra-ai/rehydra-sdk)** (MIT) — 还原闭环设计（`tool.execute.before` 还原工具入参、`experimental.text.complete` 还原 LLM 回复、`system.transform` 注入占位符指令）参考了该项目的实现思路。我们的差异：映射落盘可跨进程还原（其映射纯内存进程重启不可逆）、中文 PII 三件套（身份证 GB11643 / 手机 / 银联 Luhn）、显式 fail-closed、零依赖。
+- **[gitleaks](https://github.com/gitleaks/gitleaks)** (MIT) — 外部扫描层的第一实现；本项目按其 `dir` 子命令的参数方式调用。
+- **[betterleaks](https://github.com/betterleaks/betterleaks)** (MIT) — gitleaks 原作者与社区维护的继任实现（CLI 兼容、规则更多；本项目优先检测并调用）。
+- **[@rehydra/opencode](https://github.com/rehydra-ai/rehydra-sdk)** (MIT) — 还原闭环设计参考了该项目的实现思路。我们的差异：映射落盘可跨进程还原（其映射纯内存进程重启不可逆）、中文 PII 三件套（身份证 GB11643 / 手机 / 银联 Luhn）、显式 fail-closed、零依赖。
 
 ## License
 

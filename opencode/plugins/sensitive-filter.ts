@@ -1,5 +1,5 @@
 // 全局敏感信息过滤闸口：所有会话、发大模型前的最后一道本地过滤。
-// 过滤核心已进程内联（C 层正则 + 可选 gitleaks 增强），掩码侧不再 spawn python/node 子进程。
+// 过滤核心已进程内联（C 层正则 + 可选 betterleaks/gitleaks 增强），掩码侧不再 spawn python/node 子进程。
 // 掩码侧：experimental.chat.messages.transform（全部消息 parts）
 //        + experimental.chat.system.transform（系统提示词 + 占位符指令注入）
 // 还原侧：tool.execute.before（模型回显占位符→工具执行前还原真值）
@@ -313,11 +313,12 @@ function cLayer(text: string, sess: Session, enabled: Set<string>): void {
   }
 }
 
-// ---- gitleaks 增强层：Bun.which 检测；未安装自动跳过（不再走 WinGet 兜底路径）----
+// ---- 外部扫描器增强层：betterleaks 优先、回退 gitleaks；Bun.which 检测，未安装自动跳过 ----
 
-function gitleaksLayer(text: string, sess: Session): string {
-  const exe = Bun.which("gitleaks")
-  if (!exe) return "未安装(可选: winget install gitleaks)"
+function scannerLayer(text: string, sess: Session): string {
+  const exe = Bun.which("betterleaks") || Bun.which("gitleaks")
+  if (!exe) return "未安装(可选: betterleaks 或 gitleaks)"
+  const scanner = /betterleaks/i.test(exe) ? "betterleaks" : "gitleaks"
   const dir = mkdtempSync(join(tmpdir(), "sfilter_gl_"))
   try {
     writeFileSync(join(dir, "input.txt"), text, "utf8")
@@ -337,7 +338,7 @@ function gitleaksLayer(text: string, sess: Session): string {
     }
     let taken = 0
     for (const leak of leaks) {
-      const val = (leak.Secret || leak.Match || "").toString().trim()
+      const val = (leak.Secret || leak.secret || leak.Match || leak.match || "").toString().trim()
       if (val) {
         const idx = text.indexOf(val)
         if (idx >= 0 && sess.free(idx, idx + val.length)) {
@@ -346,7 +347,7 @@ function gitleaksLayer(text: string, sess: Session): string {
         }
       }
     }
-    return leaks.length ? `补掩 ${taken}/${leaks.length}` : "无命中"
+    return leaks.length ? `${scanner}: 补掩 ${taken}/${leaks.length}` : `${scanner}: 无命中`
   } catch (e) {
     return `跳过(${(e && (e as any).constructor && (e as any).constructor.name) || "Error"})`
   } finally {
@@ -363,7 +364,7 @@ function maskText(text: string, enabled: Set<string>, useGitleaks: boolean): {
 } {
   const sess = new Session()
   cLayer(text, sess, enabled)
-  const note = useGitleaks ? gitleaksLayer(text, sess) : "禁用"
+  const note = useGitleaks ? scannerLayer(text, sess) : "禁用"
   let out = text
   const segs = sess.taken
     .map(([s, e]) => [s, e, sess.mapping[text.slice(s, e)]] as [number, number, string])
