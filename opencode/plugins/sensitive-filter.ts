@@ -225,12 +225,12 @@ const CATS: [string, RegExp, ((s: string) => boolean) | null, number][] = [
   // 避免 indexOf 对"值==关键词"（如 password:"[SECRET_553]"）定位到前缀关键词、值泄露
   // 键为子串式（[a-z0-9_-]* 前后缀）：命中 accessSecret/accessKeyId/gitToken/clientSecret/syspw 等复合驼峰键
   ["secret", /"?[a-z0-9_-]*(?:passw(?:or)?d|passwd|pwd|pw|secret|token|api_?key|access_?key|access_?secret|auth_?key|secret_?key)[a-z0-9_-]*"?\s*[=:]\s*(\[\s*"[^\[\]]{6,}?\])/gid, null, 1],  // JSON 字符串数组值: "password": ["a","b"] → [SECRET_n]（内容须引号开头, 不再掩已有占位符→幂等）
-  ["secret", /"?[a-z0-9_-]*(?:passw(?:or)?d|passwd|pwd|pw|secret|token|api_?key|access_?key|access_?secret|auth_?key|secret_?key)[a-z0-9_-]*"?\s*[=:]\s*["']?([^\s"'`,;){\[\]]{6,})["']?/gid, null, 1],
+  ["secret", /"?[a-z0-9_-]*(?:passw(?:or)?d|passwd|pwd|pw|secret|token|api_?key|access_?key|access_?secret|auth_?key|secret_?key)[a-z0-9_-]*"?\s*[=:]\s*["']?([^\s"'`,;(){}\[\]]{6,})["']?(?![\w.(])(?!\s*[=:])/gid, null, 1],
   ["idcard", /(?<!\d)(\d{17}[\dXx])(?!\d)/gd, idcardOk, 1],
   ["phone", /(?<!\d)1[3-9]\d{9}(?!\d)/g, null, 0],
   ["bankcard", /(?<!\d)\d{16,19}(?!\d)/g, luhnOk, 0],
   ["email", /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, null, 0],
-  ["ipv4", /(?<![\d.])((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])/g, null, 0],
+  ["ipv4", /(?<![\d.])(?<![A-Za-z0-9]\/)((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])/g, null, 0],
 ]
 
 const SKIP_VALUES = new Set(["none", "null", "true", "false", "undefined", "changeme", "change-me", "todo"])
@@ -417,16 +417,22 @@ function seqBase(): Record<string, number> {
 function renumber(sess: Session, original: string): { out: string; mapping: Record<string, string> } {
   const base = seqBase()
   const newMapping: Record<string, string> = {}
+  const assigned: Record<string, string> = {}  // 本次批量内 同值同号：sess.taken 每个 span 一条记录，
+  // 若逐个 span 分配编号，同一值出现 N 次会拿到 N 个只剩最后一个进映射的编号 → 模型看到的前 N-1 个编号无映射可还原
   const segs = sess.taken.map(([s, e]) => {
     const val = original.slice(s, e)
-    const oldTok = sess.mapping[val]
-    const mm = /^\[([A-Z][A-Z0-9]*)_(\d+)\]$/.exec(oldTok)  // 类别名可含数字（IPV4）
-    let newTok = oldTok
-    if (mm) {
-      const cat = mm[1]
-      if (!(cat in base)) base[cat] = 0
-      base[cat]++
-      newTok = `[${cat}_${base[cat]}]`
+    let newTok = assigned[val]
+    if (!newTok) {
+      const oldTok = sess.mapping[val]
+      const mm = /^\[([A-Z][A-Z0-9]*)_(\d+)\]$/.exec(oldTok)  // 类别名可含数字（IPV4）
+      newTok = oldTok
+      if (mm) {
+        const cat = mm[1]
+        if (!(cat in base)) base[cat] = 0
+        base[cat]++
+        newTok = `[${cat}_${base[cat]}]`
+      }
+      if (newTok) assigned[val] = newTok
     }
     newMapping[val] = newTok
     return [s, e, newTok] as [number, number, string]
@@ -500,4 +506,5 @@ Object.assign(SensitiveFilterPlugin, {
   saveMap,
   maskBatch,
   makeSep,
+  renumber,
 })

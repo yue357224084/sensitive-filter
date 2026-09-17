@@ -104,12 +104,12 @@ const CATS = [
   // 避免 indexOf 对"值==关键词"（如 password:"[SECRET_555]"）定位到前缀关键词、值泄露
   // 键为子串式（[a-z0-9_-]* 前后缀）：命中 accessSecret/accessKeyId/gitToken/clientSecret/syspw 等复合驼峰键
   ["secret", /"?[a-z0-9_-]*(?:passw(?:or)?d|passwd|pwd|pw|secret|token|api_?key|access_?key|access_?secret|auth_?key|secret_?key)[a-z0-9_-]*"?\s*[=:]\s*(\[\s*"[^\[\]]{6,}?\])/gid, null, 1],  // JSON 字符串数组值: "password": ["a","b"] → [SECRET_n]（内容须引号开头, 不再掩已有占位符→幂等）
-  ["secret", /"?[a-z0-9_-]*(?:passw(?:or)?d|passwd|pwd|pw|secret|token|api_?key|access_?key|access_?secret|auth_?key|secret_?key)[a-z0-9_-]*"?\s*[=:]\s*["']?([^\s"'`,;){\[\]]{6,})["']?/gid, null, 1],
+  ["secret", /"?[a-z0-9_-]*(?:passw(?:or)?d|passwd|pwd|pw|secret|token|api_?key|access_?key|access_?secret|auth_?key|secret_?key)[a-z0-9_-]*"?\s*[=:]\s*["']?([^\s"'`,;(){}\[\]]{6,})["']?(?![\w.(])(?!\s*[=:])/gid, null, 1],
   ["idcard", /(?<!\d)(\d{17}[\dXx])(?!\d)/gd, idcardOk, 1],
   ["phone", /(?<!\d)1[3-9]\d{9}(?!\d)/g, null, 0],
   ["bankcard", /(?<!\d)\d{16,19}(?!\d)/g, luhnOk, 0],
   ["email", /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, null, 0],
-  ["ipv4", /(?<![\d.])((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])/g, null, 0],
+  ["ipv4", /(?<![\d.])(?<![A-Za-z0-9]\/)((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])/g, null, 0],
 ]
 
 const SKIP_VALUES = new Set(["none", "null", "true", "false", "undefined", "changeme", "change-me", "todo"])

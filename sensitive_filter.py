@@ -111,12 +111,12 @@ _CATS = [
     ("secret", r"\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{16,}", None, 0),
     # 键为子串式（[a-z0-9_-]* 前后缀）：命中 accessSecret/accessKeyId/gitToken/clientSecret/syspw 等复合驼峰键
     ("secret", r"(?i)\"?[a-z0-9_-]*(?:passw(?:or)?d|passwd|pwd|pw|secret|token|api_?key|access_?key|access_?secret|auth_?key|secret_?key)[a-z0-9_-]*\"?\s*[=:]\s*(\[\s*\"[^\[\]]{6,}?\])", None, 1),  # JSON 字符串数组值（内容须引号开头→幂等）
-    ("secret", r"(?i)\"?[a-z0-9_-]*(?:passw(?:or)?d|passwd|pwd|pw|secret|token|api_?key|access_?key|access_?secret|auth_?key|secret_?key)[a-z0-9_-]*\"?\s*[=:]\s*[\"']?([^\s\"'`,;){\[\]]{6,})[\"']?", None, 1),
+    ("secret", r"(?i)\"?[a-z0-9_-]*(?:passw(?:or)?d|passwd|pwd|pw|secret|token|api_?key|access_?key|access_?secret|auth_?key|secret_?key)[a-z0-9_-]*\"?\s*[=:]\s*[\"']?([^\s\"'`,;(){}\[\]]{6,})[\"']?(?![\w.(])(?!\s*[=:])", None, 1),
     ("idcard", r"(?<!\d)(\d{17}[\dXx])(?!\d)", idcard_ok, 1),
     ("phone", r"(?<!\d)1[3-9]\d{9}(?!\d)", None, 0),
     ("bankcard", r"(?<!\d)\d{16,19}(?!\d)", luhn_ok, 0),
     ("email", r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", None, 0),
-    ("ipv4", r"(?<![\d.])((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])", None, 0),
+    ("ipv4", r"(?<![\d.])(?<![A-Za-z0-9]\/)((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])", None, 0),
 ]
 
 _SKIP_VALUES = {"none", "null", "true", "false", "undefined", "changeme", "change-me", "todo"}
