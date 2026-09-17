@@ -116,7 +116,7 @@ SF_UPSTREAM=https://your-upstream/v1 bun codex/proxy.mjs
 
 映射文件为 `sensitive_filter_map_<sha8>.json`（`{source_sha256, tokens}` 双向字典，仅存本地）。插件与 CLI 须指向**同一目录**才能互相还原（插件用 `SF_MAP_DIR`，CLI 用 `--map-out`）。
 
-配置优先级：同目录 `.env` > 系统环境变量。仓库根有 `.env` 模板（默认全注释，取消注释即生效）。各程序读自身所在目录的 `.env`。
+配置优先级：同目录 `.env` > 系统环境变量。仓库根有 `.env.example` 模板：复制为 `.env` 并取消注释即生效（`.env` 已被 `.gitignore` 忽略，不会提交真实密钥）。各程序读自身所在目录的 `.env`。
 
 ## 层级架构 / Layers
 

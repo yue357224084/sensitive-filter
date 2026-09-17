@@ -3,5 +3,7 @@ __pycache__/
 node_modules/
 *.log
 .DS_Store
+# 本地配置（真实密钥）；模板见 .env.example
+.env
 # 对拍样本由 test/parity/gen_samples.py 现场生成（含 token 形态，入库会被 GitHub Push Protection 误报）
 test/parity/samples.txt
