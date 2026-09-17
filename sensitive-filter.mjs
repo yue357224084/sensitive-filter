@@ -410,4 +410,26 @@ function main() {
   return 0
 }
 
-process.exit(main())
+// ---------------------------------------------------------------- 导出（供 codex/proxy.mjs 复用；不改变直接执行行为）
+
+function enabledSet() {
+  const allCats = new Set(CATS.map((c) => c[0]))
+  const only = process.env.SF_ONLY
+  if (only) {
+    return new Set(only.split(",").map((s) => s.trim()).filter((c) => allCats.has(c)))
+  }
+  const skip = new Set((process.env.SF_SKIP || "").split(",").map((s) => s.trim()))
+  return new Set([...allCats].filter((c) => !skip.has(c)))
+}
+
+export { CATS, maskText, saveMap, enabledSet }
+
+// 直接执行时跑 CLI；被 import 时不执行（proxy 以模块方式复用核心函数）。
+import { pathToFileURL } from "node:url"
+const _normUrl = (u) => (process.platform === "win32" ? u.toLowerCase() : u)
+if (
+  process.argv[1] &&
+  _normUrl(import.meta.url) === _normUrl(pathToFileURL(path.resolve(process.argv[1])).href)
+) {
+  process.exit(main())
+}
