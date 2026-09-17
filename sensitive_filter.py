@@ -225,13 +225,27 @@ def read_local(path: str, what: str) -> str:
         raise SystemExit(2)
 
 
-def _sweep_old_maps():
-    """清理临时目录里超过 24h 的映射文件（内含明文敏感值，不能无限堆积）。"""
-    now = time.time()
-    for old in Path(tempfile.gettempdir()).glob(f"{_MAP_PREFIX}*.json"):
+def _sweep_maps() -> None:
+    """保留最新 N 个映射文件（默认 5000，SF_MAP_KEEP 可调）；按容量而非按龄。
+
+    映射寿命必须 ≥ 模型上下文寿命：按龄删除会让旧编号静默失联（占位符字面量落盘）。
+    """
+    files = []
+    for f in Path(tempfile.gettempdir()).glob(f"{_MAP_PREFIX}*.json"):
         try:
-            if now - old.stat().st_mtime > 86400:
-                old.unlink()
+            files.append((f.stat().st_mtime, f))
+        except OSError:
+            pass
+    try:
+        keep = max(1, int(os.environ.get("SF_MAP_KEEP", "5000")))
+    except ValueError:
+        keep = 5000
+    if len(files) <= keep:
+        return
+    files.sort(key=lambda x: -x[0])  # 新→旧，超出部分从最旧删
+    for _, f in files[keep:]:
+        try:
+            f.unlink()
         except OSError:
             pass
 
@@ -245,7 +259,6 @@ def save_map(mapping: dict, masked_text: str, map_out: str | None) -> Path:
         if p.is_dir() or (not p.suffix and not p.exists()):
             p = p / f"{_MAP_PREFIX}{digest[:8]}.json"
     else:
-        _sweep_old_maps()
         p = Path(tempfile.gettempdir()) / f"{_MAP_PREFIX}{digest[:8]}.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     bidir = {**mapping}
@@ -253,6 +266,8 @@ def save_map(mapping: dict, masked_text: str, map_out: str | None) -> Path:
         bidir[v] = k
     p.write_text(json.dumps({"source_sha256": digest, "tokens": bidir},
                             ensure_ascii=False), encoding="utf-8")
+    if not map_out:
+        _sweep_maps()  # 写后清理：保证目录内文件数不超过 SF_MAP_KEEP
     return p
 
 

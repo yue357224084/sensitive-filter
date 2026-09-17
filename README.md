@@ -19,9 +19,9 @@ Run logs/config/code before pasting them into a cloud LLM (or your chat context)
 | 邮箱 Email | 通用邮箱格式 |
 | IPv4 | 点分十进制，RFC 5737 保留段不豁免（按需 `--skip ipv4`） |
 
-输出可逆：脱敏为 `[SECRET_2]`/`[IDCARD_1]`/`[PHONE_1]`/`[BANKCARD_1]`/`[EMAIL_1]`/`[IPV4_1]` 形占位符，映射文件仅存本地，LLM 返回后 `--restore` 回填。映射文件名与内容 sha256 绑定，防错配；超过 24h 自动清理。
+输出可逆：脱敏为 `[SECRET_2]`/`[IDCARD_1]`/`[PHONE_1]`/`[BANKCARD_1]`/`[EMAIL_1]`/`[IPV4_1]` 形占位符，映射文件仅存本地，LLM 返回后 `--restore` 回填。映射文件名与内容 sha256 绑定，防错配；超过上限自动清理（默认保留 5000 个，从最旧删）。
 
-Reversible: tokens like `[SECRET_2]`/`[IDCARD_1]`/`[PHONE_1]`/`[BANKCARD_1]`/`[EMAIL_1]`/`[IPV4_1]`; the mapping file stays local and `--restore` refills values after the LLM replies. Map filename is hash-bound to content and auto-cleaned after 24h.
+Reversible: tokens like `[SECRET_2]`/`[IDCARD_1]`/`[PHONE_1]`/`[BANKCARD_1]`/`[EMAIL_1]`/`[IPV4_1]`; the mapping file stays local and `--restore` refills values after the LLM replies. Map filename is hash-bound to content; auto-cleaned by capacity (default keep 5000, oldest first).
 
 ## 映射文件位置 / Map file location
 
@@ -82,50 +82,53 @@ node sensitive-filter.mjs 文件.txt --skip ipv4
 - `--no-gitleaks` 禁用 gitleaks 补充层
 
 
-## opencode 插件部署 / opencode plugin
+## 原理与部署 / Principle & Deployment
 
-**单文件部署**：只需复制 `plugin/sensitive-filter.ts` 到用户 opencode plugins 目录，重启 opencode 即可。过滤核心（正则层/占位符/映射读写/24h 清理/gitleaks 增强）已内联进插件进程内，无需 Python 依赖。gitleaks 为可选增强，没装自动跳过。
+**原理**：所有发往大模型的内容（用户消息、系统提示、工具输出）在出境前替换为占位符（`192.0.2.1`/`sk-AbCdEf0123456789AbCdEf0123456789` 等），映射文件仅存本地。模型只看到占位符，引用时原样保留。工具执行前与回复展示前自动还原为真值。任何环节异常则阻断发送（fail-closed），原文绝不外泄。
+
+### opencode 插件
 
 ```bash
 mkdir -p ~/.config/opencode/plugins
-cp plugin/sensitive-filter.ts ~/.config/opencode/plugins/
+cp opencode/plugins/sensitive-filter.ts ~/.config/opencode/plugins/
+# 重启 opencode 生效
 ```
 
-- 插件在**每次调用大模型前**自动脱敏全部消息（用户文本/reasoning/工具输出/入参/子任务）与系统提示词；工具执行前与回复展示前自动把占位符还原为真值，无需手动 `--restore`
-- 脱敏侧不再 spawn python/node 子进程——脱敏逻辑进程内调用；gitleaks 增强层用 `Bun.which` 检测本机安装，有则临时文件 + `gitleaks dir` 补充脱敏，没装自动跳过（不报错）
-- 还原查找读系统临时目录的映射文件（Windows `%TEMP%`，类 Unix `$TMPDIR`）
-- fail-closed：脱敏/还原任何环节异常都会阻断发送或阻断工具执行，原文绝不外泄
+每次调用大模型前自动掩码全部消息与系统提示，工具执行前与回复展示前自动还原。核心正则层进程内联，无需 Python；gitleaks 可选增强（`Bun.which` 检测，未装自动跳过）。
 
-开关（环境变量）：
+> 注意：会话标题生成调用不过插件（opencode issue #46115），首条消息可能明文到达标题模型；如需规避设 `"agent": { "title": { "disable": true } }`。
 
-| 变量 | 作用 |
-|---|---|
-| `SF_OFF=1` | 全局停用 |
-| `SF_ONLY=类别` | 只启用指定类别 |
-| `SF_SKIP=类别` | 跳过指定类别（如排障时 `SF_SKIP=ipv4`） |
-| `SF_MAP_DIR=目录` | 映射文件目录（默认系统临时目录；与 CLI `--map-out` 指同一目录才可互操作还原） |
+### Codex CLI 代理
 
-配置来源优先级：**程序同目录 `.env` > 系统环境变量**（两者都配置时以 `.env` 为准）。`.env` 支持 `KEY=VALUE`、`export KEY=VALUE`、`#` 注释、引号包裹值；文件不存在则静默跳过。各程序读取自身所在目录：CLI/映射核心读仓库根的 `.env`，opencode 插件读插件文件所在目录（全局部署时即 `~/.config/opencode/plugins/.env`），Codex 代理读 `codex/.env`（proxy 还会先加载被复用核心所在目录的 `.env`，`codex/.env` 后加载、优先生效）。
-
-仓库根提供 `.env` 模板：列出全部变量与默认值（本插件 4 项 + Codex 代理 3 项 `SF_PROXY_PORT` / `SF_PROXY_HOST` / `SF_UPSTREAM`，默认 3141 / 全部接口 / OpenAI 官方），**默认整份注释**——不改变行为、不影响系统环境变量；取消注释某行即启用（按上面的优先级覆盖系统环境变量）。注意启用行也会覆盖脚本/测试注入的同名变量，仓库自带测试请在模板保持注释状态下运行。
-
-已知限制：会话标题生成调用不过插件（opencode issue #46115），首条消息可能明文到达标题模型；如需规避设 `"agent": { "title": { "disable": true } }`。
-
-设置环境变量 / Setting env vars：
+Codex 无原生请求改写钩子，通过本地反向代理接入：
 
 ```bash
-# Linux / macOS
-export SF_SKIP=ipv4          # 临时放行 IP（如排障时）
-export SF_OFF=1              # 临时全局停用
-# 持久化写入 ~/.bashrc 或 ~/.zshrc  或 
+# 1. 启动代理（后台）
+SF_UPSTREAM=https://your-upstream/v1 bun codex/proxy.mjs
 
-# Windows PowerShell
-$env:SF_SKIP = "ipv4"
-$env:SF_OFF = "1"
-# 持久化: setx SF_SKIP ipv4
+# 2. config.toml 指向代理
+# [model_providers.openaig]
+# base_url = "http://127.0.0.1:3141/v1"
+
+# 3. 重启 codex
 ```
 
-English: copy `plugin/sensitive-filter.ts` into `~/.config/opencode/plugins/` and restart opencode. It masks every outgoing message and the system prompt before the LLM call, restores placeholders before tool execution and reply display, and fails closed on any error. Set `SF_OFF=1` to disable, `SF_ONLY`/`SF_SKIP` to control categories.
+代理出站掩码 `instructions`/`input` + 注入占位符指令 + 确定性持久映射（与 CLI/插件互操作）；入站 SSE 跨 chunk 还原 + JSON 递归还原。
+
+## 开关 / Configuration
+
+| 变量 | 作用 | 默认 |
+|---|---|---|
+| `SF_OFF=1` | 全局停用 | — |
+| `SF_ONLY=类别` | 只启用指定类别 | 全部 |
+| `SF_SKIP=类别` | 跳过指定类别 | 无 |
+| `SF_MAP_DIR=目录` | 映射文件目录 | 系统临时目录 |
+| `SF_MAP_KEEP=数量` | 映射保留上限（从最旧清理） | 5000 |
+| `SF_PROXY_PORT` | Codex 代理监听端口 | 3141 |
+| `SF_PROXY_HOST` | Codex 代理监听地址 | 全部接口 |
+| `SF_UPSTREAM` | Codex 代理转发上游 | OpenAI 官方 |
+
+配置优先级：同目录 `.env` > 系统环境变量。仓库根有 `.env` 模板（默认全注释，取消注释即生效）。各程序读自身所在目录的 `.env`。
 
 ## 层级架构 / Layers
 
@@ -139,6 +142,9 @@ English: copy `plugin/sensitive-filter.ts` into `~/.config/opencode/plugins/` an
 - 中文语义 PII（人名/地址）当前不覆盖——正则层只抓固定格式
 - 带空格/横线分组的银行卡不检测；15 位旧身份证不检测
 - 纯格式规则（手机号/IP）有少量误报属正常，宁多勿漏
+- 关键名字串匹配（`passwd`/`token`/`secret` 等）区分不了「标识符」与「凭据值」，纯词如 `passwd` 也可能被登记掩码——属宁多勿漏取舍
+- 占位符查不到映射时（映射被清理/跨机/跨目录）保持原样并在 stderr 告警一次，不会静默改写
+- 脱敏只覆盖「发往模型的那份拷贝」：本地数据库 part 列、临时映射文件（含双向还原表）均为明文，请自行控制目录权限与清理
 
 ## 语义 PII 扩展（预留）/ Semantic PII extension (reserved)
 

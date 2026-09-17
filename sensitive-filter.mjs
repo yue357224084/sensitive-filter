@@ -239,17 +239,23 @@ function readLocal(p, what) {
   }
 }
 
-function sweepOldMaps() {
-  const now = Date.now() / 1000
+// 清理策略 = 容量约束（保留最新 N 个，默认 5000，SF_MAP_KEEP 可调），不再按 24h 年龄删。
+// 理由：映射寿命必须 ≥ 模型上下文寿命 —— 按龄删会让旧编号静默失联（占位符字面量落盘）。
+function sweepMaps() {
+  const dir = os.tmpdir()
   let names = []
-  try { names = readdirSync(os.tmpdir()) } catch { return }
+  try { names = readdirSync(dir) } catch { return }
+  const files = []
   for (const name of names) {
     if (!name.startsWith(MAP_PREFIX) || !name.endsWith(".json")) continue
-    try {
-      if (now - statSync(path.join(os.tmpdir(), name)).mtimeMs / 1000 > 86400) {
-        unlinkSync(path.join(os.tmpdir(), name))
-      }
-    } catch { /* 坏文件跳过 */ }
+    const p = path.join(dir, name)
+    try { files.push({ p, m: statSync(p).mtimeMs }) } catch { /* 坏文件跳过 */ }
+  }
+  const keep = Math.max(1, Number(process.env.SF_MAP_KEEP || 5000) || 5000)
+  if (files.length <= keep) return
+  files.sort((a, b) => b.m - a.m)  // 新→旧，超出部分从最旧删
+  for (const f of files.slice(keep)) {
+    try { unlinkSync(f.p) } catch { /* 坏文件跳过 */ }
   }
 }
 
@@ -264,13 +270,13 @@ function saveMap(mapping, maskedText, mapOut) {
       p = path.join(p, `${MAP_PREFIX}${digest.slice(0, 8)}.json`)
     }
   } else {
-    sweepOldMaps()
     p = path.join(os.tmpdir(), `${MAP_PREFIX}${digest.slice(0, 8)}.json`)
   }
   mkdirSync(path.dirname(p), { recursive: true })
   const bidir = { ...mapping }
   for (const [k, v] of Object.entries(mapping)) bidir[v] = k
   writeFileSync(p, JSON.stringify({ source_sha256: digest, tokens: bidir }), "utf8")
+  if (!mapOut) sweepMaps()  // 写后清理：保证目录内文件数不超过 SF_MAP_KEEP
   return p
 }
 

@@ -103,40 +103,78 @@ function collectPartSlots(p: any, slots: Slot[]): void {
 
 // ---------- 还原：token → 真值（读 os.tmpdir() 映射文件，按 mtime 新者优先） ----------
 
-let mapCache: { key: string; lookup: Map<string, string> } | null = null
+// 一次扫描得到三张表（tok→值 供还原、值→tok 供跨批次复用编号、各类别最大编号供分配）。
+// 缓存键 = 文件数:最新 mtime —— 新写 map 后自动失效重扫。
+type MapScan = { tok2val: Map<string, string>; val2tok: Map<string, string>; maxByCat: Record<string, number> }
+let scanCache: { key: string; scan: MapScan } | null = null
 
-function tokenLookup(): Map<string, string> {
+function scanMaps(): MapScan {
   const dir = mapDir()
   const files: { name: string; m: number }[] = []
-  for (const name of readdirSync(dir)) {
-    if (!name.startsWith("sensitive_filter_map_") || !name.endsWith(".json")) continue
-    try {
-      files.push({ name, m: statSync(join(dir, name)).mtimeMs })
-    } catch {}
-  }
+  try {
+    for (const name of readdirSync(dir)) {
+      if (!name.startsWith(MAP_PREFIX) || !name.endsWith(".json")) continue
+      try {
+        files.push({ name, m: statSync(join(dir, name)).mtimeMs })
+      } catch {}
+    }
+  } catch { /* 目录不可读：返回空表 */ }
   const newest = files.reduce((a, f) => Math.max(a, f.m), 0)
-  const key = `${files.length}:${newest}`
-  if (mapCache?.key === key) return mapCache.lookup
-  const lookup = new Map<string, string>()
-  // map 的 tokens 是双向字典：{[CAT_n]: 原值, 原值: [CAT_n], 类别描述: [CAT_n]}。
-  // 还原只取占位符形 key；同一 token 跨文件冲突时新值胜出（ponytail: 简单近似，按 mtime 降序先到先得）。
+  const key = `${dir}:${files.length}:${newest}`
+  if (scanCache?.key === key) return scanCache.scan
+  const tok2val = new Map<string, string>()
+  const val2tok = new Map<string, string>()
+  const maxByCat: Record<string, number> = {}
+  const tokRe = /^\[([A-Z][A-Z0-9]*)_(\d+)\]$/  // 类别名可含数字（IPV4）
+  // tokens 是双向字典：{[CAT_n]: 原值, 原值: [CAT_n], 类别描述: [CAT_n]}。
+  // 按 mtime 降序先到先得（同键冲突时新文件胜出）。
   files.sort((a, b) => b.m - a.m)
   for (const f of files) {
     try {
       const tokens = JSON.parse(readFileSync(join(dir, f.name), "utf8"))?.tokens
       if (!tokens || typeof tokens !== "object") continue
       for (const [k, v] of Object.entries(tokens)) {
-        if (TOKEN_HAS.test(k) && typeof v === "string" && !lookup.has(k)) lookup.set(k, v)
+        const ks = typeof k === "string" ? k : ""
+        const vs = typeof v === "string" ? v : ""
+        const kTok = tokRe.exec(ks)
+        const vTok = tokRe.exec(vs)
+        if (kTok) {
+          if (!tok2val.has(ks)) tok2val.set(ks, vs)
+          maxByCat[kTok[1]] = Math.max(maxByCat[kTok[1]] ?? 0, Number(kTok[2]))
+        }
+        if (vTok) {
+          if (!tok2val.has(vs)) tok2val.set(vs, ks)
+          maxByCat[vTok[1]] = Math.max(maxByCat[vTok[1]] ?? 0, Number(vTok[2]))
+        }
+        // 原值 → 占位符（供 renumber 跨批次复用编号，避免同值每请求换号后旧号失联）
+        if (kTok && vs && !vTok && !val2tok.has(vs)) val2tok.set(vs, ks)
+        if (vTok && ks && !kTok && !val2tok.has(ks)) val2tok.set(ks, vs)
       }
     } catch { /* 坏文件跳过 */ }
   }
-  mapCache = { key, lookup }
-  return lookup
+  const scan = { tok2val, val2tok, maxByCat }
+  scanCache = { key, scan }
+  return scan
 }
+
+function tokenLookup(): Map<string, string> {
+  return scanMaps().tok2val
+}
+
+// 无映射令牌：把"静默污染"变成可见告警（同一进程内每个编号只报一次）
+const auditedMissing = new Set<string>()
 
 function rehydrate(text: string): string {
   if (!text || !TOKEN_HAS.test(text)) return text
-  return text.replace(TOKEN_ANY, (t) => tokenLookup().get(t) ?? t)
+  return text.replace(TOKEN_ANY, (t) => {
+    const v = tokenLookup().get(t)
+    if (v !== undefined) return v
+    if (!auditedMissing.has(t)) {
+      auditedMissing.add(t)
+      console.error(`[sensitive-filter] 未映射占位符 ${t} 保持原样（映射可能已过期/被清理；如需还原用 CLI --restore）`)
+    }
+    return t
+  })
 }
 
 function deepRehydrate(v: any): any {
@@ -338,27 +376,34 @@ function maskText(text: string, enabled: Set<string>, useGitleaks: boolean): {
 
 const MAP_PREFIX = "sensitive_filter_map_"
 
-function sweepOldMaps(): void {
-  const now = Date.now() / 1000
+// 清理策略 = 容量约束（保留最新 N 个，默认 5000，SF_MAP_KEEP 可调），不再按 24h 年龄删。
+// 理由：映射寿命必须 ≥ 模型上下文寿命 —— 会话超 24h 或恢复旧会话时，模型上下文里的编号
+// 仍需可还原；按龄删除会让旧编号静默失联（占位符字面量落盘）。
+function sweepMaps(): void {
+  const dir = mapDir()
   let names: string[] = []
-  try { names = readdirSync(mapDir()) } catch { return }
+  try { names = readdirSync(dir) } catch { return }
+  const files: { p: string; m: number }[] = []
   for (const name of names) {
     if (!name.startsWith(MAP_PREFIX) || !name.endsWith(".json")) continue
-    try {
-      if (now - statSync(join(mapDir(), name)).mtimeMs / 1000 > 86400) {
-        unlinkSync(join(mapDir(), name))
-      }
-    } catch { /* 坏文件跳过 */ }
+    const p = join(dir, name)
+    try { files.push({ p, m: statSync(p).mtimeMs }) } catch { /* 坏文件跳过 */ }
+  }
+  const keep = Math.max(1, Number(process.env.SF_MAP_KEEP || 5000) || 5000)
+  if (files.length <= keep) return
+  files.sort((a, b) => b.m - a.m)  // 新→旧，超出部分从最旧删
+  for (const f of files.slice(keep)) {
+    try { unlinkSync(f.p) } catch { /* 坏文件跳过 */ }
   }
 }
 
 function saveMap(mapping: Record<string, string>, maskedText: string): string {
   const digest = createHash("sha256").update(maskedText, "utf8").digest("hex")
-  sweepOldMaps()
   const p = join(mapDir(), `${MAP_PREFIX}${digest.slice(0, 8)}.json`)
   const bidir: Record<string, string> = { ...mapping }
   for (const [k, v] of Object.entries(mapping)) bidir[v] = k
   writeFileSync(p, JSON.stringify({ source_sha256: digest, tokens: bidir }), "utf8")
+  sweepMaps()  // 写后清理：保证目录内文件数不超过 SF_MAP_KEEP
   return p
 }
 
@@ -374,54 +419,20 @@ function enabledSet(): Set<string> {
   return new Set([...allCats].filter((c) => !skip.has(c)))
 }
 
-// ---- 全局唯一编号（修 system/messages 两个 hook 各自独立 Session 同号冲突）----
-// 仅插件层 maskBatch 用：掩码后按"已有映射最大编号+1"重编号，跨 hook/跨批次同号不撞。
-// CLI（mjs/py）单 Session 连续编号，不走此路；maskText 也不走（保持 py↔ts parity 逐字节一致）。
-
-let seqBaseCache: { key: string; base: Record<string, number> } | null = null
-
-function seqBase(): Record<string, number> {
-  const dir = mapDir()
-  let files: { name: string; m: number }[] = []
-  try {
-    for (const name of readdirSync(dir)) {
-      if (!name.startsWith(MAP_PREFIX) || !name.endsWith(".json")) continue
-      try { files.push({ name, m: statSync(join(dir, name)).mtimeMs }) } catch {}
-    }
-  } catch { /* tmpdir 不可读时从 0 起 */ }
-  const newest = files.reduce((a, f) => Math.max(a, f.m), 0)
-  const key = `${files.length}:${newest}`
-  if (seqBaseCache && seqBaseCache.key === key) return seqBaseCache.base
-  const base: Record<string, number> = {}
-  const tokRe = /^\[([A-Z][A-Z0-9]*)_(\d+)\]$/  // 类别名可含数字（IPV4）
-  files.sort((a, b) => b.m - a.m)
-  for (const f of files) {
-    try {
-      const tokens = JSON.parse(readFileSync(join(dir, f.name), "utf8"))?.tokens
-      if (!tokens || typeof tokens !== "object") continue
-      for (const [k, v] of Object.entries(tokens)) {
-        // 双向字典：key 或 value 都可能是占位符形式
-        for (const s of [k, v]) {
-          if (typeof s !== "string") continue
-          const mm = tokRe.exec(s)
-          if (mm) base[mm[1]] = Math.max(base[mm[1]] ?? 0, Number(mm[2]))
-        }
-      }
-    } catch { /* 坏文件跳过 */ }
-  }
-  seqBaseCache = { key, base }
-  return base
-}
-
 // 按 sess.taken spans 重建原文并分配全局唯一编号；不用字符串 replace（会误伤文本里已有的旧字面 token）
 function renumber(sess: Session, original: string): { out: string; mapping: Record<string, string> } {
-  const base = seqBase()
+  const { tok2val, val2tok, maxByCat: base } = scanMaps()
   const newMapping: Record<string, string> = {}
   const assigned: Record<string, string> = {}  // 本次批量内 同值同号：sess.taken 每个 span 一条记录，
   // 若逐个 span 分配编号，同一值出现 N 次会拿到 N 个只剩最后一个进映射的编号 → 模型看到的前 N-1 个编号无映射可还原
   const segs = sess.taken.map(([s, e]) => {
     const val = original.slice(s, e)
     let newTok = assigned[val]
+    if (!newTok) {
+      // 跨批次复用：同值若已有映射编号则沿用（避免同值每请求换号，旧号随映射清理失联）
+      const cand = val2tok.get(val)
+      if (cand && tok2val.get(cand) === val) newTok = cand  // 反向一致才复用，防跨文件歧义
+    }
     if (!newTok) {
       const oldTok = sess.mapping[val]
       const mm = /^\[([A-Z][A-Z0-9]*)_(\d+)\]$/.exec(oldTok)  // 类别名可含数字（IPV4）

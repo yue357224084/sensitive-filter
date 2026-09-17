@@ -5,7 +5,7 @@
 //  3) 键值规则误伤代码右值（值是更大表达式前缀 / 链式赋值）
 // 注意：所有占位符与样本运行时拼接，源码不写字面形态。
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { mkdtempSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import SensitiveFilterPlugin from "../opencode/plugins/sensitive-filter.ts"
@@ -21,16 +21,20 @@ const urlIp = "198.51.100." + "24"
 const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/" + "1.2" + "." + "3.4" + " Edg/" + "5.6" + "." + "7.8"
 
 let prevMapDir: string | undefined
+let prevMapKeep: string | undefined
 let mapDir = ""
 
 beforeEach(() => {
   prevMapDir = process.env.SF_MAP_DIR
+  prevMapKeep = process.env.SF_MAP_KEEP
   mapDir = mkdtempSync(join(tmpdir(), "sf_regress_"))
   process.env.SF_MAP_DIR = mapDir
 })
 afterEach(() => {
   if (prevMapDir === undefined) delete process.env.SF_MAP_DIR
   else process.env.SF_MAP_DIR = prevMapDir
+  if (prevMapKeep === undefined) delete process.env.SF_MAP_KEEP
+  else process.env.SF_MAP_KEEP = prevMapKeep
   try { rmSync(mapDir, { recursive: true, force: true }) } catch { /* win32 偶发 EBUSY，残留无害 */ }
 })
 
@@ -97,5 +101,63 @@ describe("regress: 键值规则不误伤代码", () => {
 
     const { sess: s2 } = maskText('{"token": "abc.def123"}', allCats(), false)
     expect(s2.mapping["abc.def123"]).toMatch(/^\[SECRET_\d+\]$/)
+  })
+})
+
+describe("regress: 跨批次编号复用（映射寿命 ≥ 上下文寿命）", () => {
+  test("同一值第二次请求沿用同一编号（旧实现每批次换号）", () => {
+    const val = "203.0.113." + "9"
+    const span = (t: string) => {
+      const i = t.indexOf(val)
+      return [[i, i + val.length]] as [number, number][]
+    }
+    const t1 = "x=" + val
+    const r1 = renumber({ taken: span(t1), mapping: { [val]: T("IPV4", 1) } }, t1)
+    expect(r1.mapping[val]).toMatch(TOK_IPV4)
+    saveMap(r1.mapping, r1.out)  // 落盘后 scanMaps 才能看到该值 → 复用
+    const t2 = "y=" + val
+    const r2 = renumber({ taken: span(t2), mapping: { [val]: T("IPV4", 1) } }, t2)
+    expect(r2.mapping[val]).toBe(r1.mapping[val])  // 旧实现会分配 +1 的新号 → 此处必败
+    expect(rehydrate(r2.out)).toBe(t2)  // 复用的编号可还原
+  })
+})
+
+describe("regress: 映射清理按容量而非按龄", () => {
+  test("超 24h 但仍在保留数内的映射不被删；只删超出容量的最旧者", () => {
+    process.env.SF_MAP_KEEP = "3"
+    const mk = (name: string, ageDays: number) => {
+      const p = join(mapDir, "sensitive_filter_map_" + name + ".json")
+      const old = "202.0.113." + "1"
+      writeFileSync(p, JSON.stringify({ source_sha256: "x", tokens: { [old]: T("IPV4", 1) } }), "utf8")
+      const t = Date.now() / 1000 - ageDays * 86400
+      utimesSync(p, t, t)
+      return p
+    }
+    const p3 = mk("old3", 3)
+    const p2 = mk("old2", 2)
+    const p1 = mk("old1", 1)
+    saveMap({ a: T("SECRET", 1) }, "masked-1")
+    saveMap({ b: T("SECRET", 2) }, "masked-2")
+    expect(existsSync(p1)).toBe(true)  // 超 24h 但在容量内 → 保留（旧实现按龄删，此处必败）
+    expect(existsSync(p2)).toBe(false)  // 仅保留最新 3 个
+    expect(existsSync(p3)).toBe(false)
+    expect(readdirSync(mapDir).filter((n) => n.endsWith(".json")).length).toBe(3)
+  })
+})
+
+describe("regress: 无映射占位符告警", () => {
+  test("映射缺失时保持原样并记一次告警（同编号去重）", () => {
+    const tok = T("SECRET", 987654)
+    const logs: string[] = []
+    const orig = console.error
+    console.error = (...a: any[]) => { logs.push(a.join(" ")) }
+    try {
+      expect(rehydrate("x " + tok + " y")).toBe("x " + tok + " y")
+      rehydrate("again " + tok)
+    } finally {
+      console.error = orig
+    }
+    expect(logs.length).toBe(1)  // 旧实现无告警 → 必败
+    expect(logs[0]).toContain(tok)
   })
 })
