@@ -4,7 +4,8 @@
 //        + experimental.chat.system.transform（系统提示词 + 占位符指令注入）
 // 还原侧：tool.execute.before（模型回显占位符→工具执行前还原真值）
 //        + experimental.text.complete（LLM 回复展示前还原）
-// 映射落盘：os.tmpdir()/sensitive_filter_map_<sha8>.json（默认；SF_MAP_DIR 可改目录。24h 自动清理；
+// 映射落盘：os.tmpdir()/sensitive_filter_map_<sha8>.json（默认；SF_MAP_DIR 可改目录。按容量清理，保留最新
+//   SF_MAP_KEEP 个（默认 5000）；
 //   与 sensitive_filter.py / sensitive-filter.mjs 的 --restore 双向互操作）
 // 失败策略：fail-closed——掩码侧异常阻断发送；还原侧异常阻断工具执行/回复。
 // 开关：环境变量 SF_OFF=1 全局停用；SF_ONLY=类别 只启用部分类别；SF_SKIP=类别 跳过部分类别。

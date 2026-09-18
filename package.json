@@ -1,0 +1,14 @@
+{
+  "name": "sensitive-filter",
+  "version": "1.0.0",
+  "private": true,
+  "description": "发给大模型前的本地敏感信息过滤（可逆脱敏）：Codex 反向代理 / OpenCode 插件 / CLI",
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "parity": "node test/parity/parity.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

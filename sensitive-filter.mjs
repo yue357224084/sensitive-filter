@@ -328,7 +328,9 @@ function parseArgs(argv) {
     else if (name === "--no-gitleaks") args.noGitleaks = true
     else if (name === "--force") args.force = true
     else if (name === "--selftest") args.selftest = true
-    else args.inputs.push(a)
+    else if (a.startsWith("--")) {
+      console.error(`[警告] 未知参数已忽略: ${a}`) // 曾把 --foo 当输入文件名读，报"文件不存在"
+    } else args.inputs.push(a)
   }
   return args
 }

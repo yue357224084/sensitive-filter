@@ -5,8 +5,9 @@
 //
 // 用法: node codex/proxy.mjs（bun 亦可；node 需 ≥20，fetch/Request/Response 为全局）
 // 环境变量:
-//   SF_PROXY_PORT 监听端口（默认 3141）   SF_PROXY_HOST 监听地址（默认全部接口；部署时设为目标内网 IP）
+//   SF_PROXY_PORT 监听端口（默认 3141）   SF_PROXY_HOST 监听地址（默认 127.0.0.1，仅本机；对外需显式设，代理无鉴权）
 //   SF_UPSTREAM   上游 base_url（默认 https://api.openai.com/v1）
+//   SF_MAX_BODY_MB 请求体大小上限，超限 fail-closed 返回 413（默认 64）
 //   SF_MAP_DIR    映射目录（默认 os.tmpdir()，与 CLI --restore 双向互操作）
 //   SF_OFF=1      代理直接退出        SF_ONLY / SF_SKIP 沿用 enabledSet() 语义
 //   SF_PROXY_DEBUG=1（或启动参数 --debug）
@@ -67,6 +68,8 @@ const TOKEN_STRIP = /\[(?:SECRET|IDCARD|PHONE|BANKCARD|EMAIL|IPV4)_\d+\]/g
 // 可能是不完整占位符的前缀（尾缓冲延迟释放用）：如 "[SECRET" "[SECRET_" "[SECRET_" 加数字
 const PARTIAL = /\[(?:SECRET|IDCARD|PHONE|BANKCARD|EMAIL|IPV4)(?:_\d*)?$/
 const MAX_TAIL = 32
+// 请求体大小上限（默认 64MB，SF_MAX_BODY_MB 可调）：整包 JSON.parse 进内存，超限 fail-closed 防内存耗尽。
+const MAX_BODY = Math.max(1, Number(process.env.SF_MAX_BODY_MB || 64) || 64) * 1024 * 1024
 
 function mapDir() {
   const d = process.env.SF_MAP_DIR || os.tmpdir()
@@ -78,16 +81,15 @@ function mapDir() {
 const g = { rev: new Map(), fwd: new Map(), maxIdx: {} } // rev: 原文→占位符; fwd: 占位符→原文
 let gSig = null
 
+// 映射文件名 = 掩码内容 sha256 前 8 位（见 saveMap），内容变则名变、同名即同内容；
+// 故"文件名集合"就是完整签名，无需逐文件 statSync（曾让每次请求对上限 5000 个文件做 stat）。
 function dirSig() {
-  let sig = ""
   try {
-    const names = readdirSync(mapDir()).filter((n) => n.startsWith(MAP_PREFIX) && n.endsWith(".json")).sort()
-    sig = `${names.length}:`
-    for (const n of names) {
-      try { sig += `${n}:${statSync(path.join(mapDir(), n)).mtimeMs}` } catch { sig += `${n}:x` }
-    }
-  } catch { sig = "0:" }
-  return sig
+    return readdirSync(mapDir())
+      .filter((n) => n.startsWith(MAP_PREFIX) && n.endsWith(".json"))
+      .sort()
+      .join("|")
+  } catch { return "" }
 }
 
 function loadMaps() {
@@ -171,11 +173,16 @@ function maskDeep(v, mask) {
 function maskRequestBody(body) {
   const masked = { n: 0 }
   const mask = (t) => maskSlot(t, enabled, masked)
-  if (typeof body.instructions === "string" && body.instructions.trim()) {
-    body.instructions = mask(body.instructions) + "\n\n" + SF_INSTRUCTION
+  // 无论请求是否带 instructions 都要注入占位符说明：Codex 无自定义指令时该字段缺失，
+  // 不注入则模型不知道 [SECRET_n] 的语义，可能改写格式或编造原值。
+  const instr = typeof body.instructions === "string" ? body.instructions : ""
+  body.instructions = (instr.trim() ? mask(instr) + "\n\n" : "") + SF_INSTRUCTION
+  // 其余顶层字段整体递归（tools[].description、prompt、metadata 等一律覆盖，不再只扫 instructions/input）。
+  // maskText 只命中固定格式，对 type/id/call_id 等元数据无副作用且幂等（同 input 的既有论证）。
+  for (const k of Object.keys(body)) {
+    if (k === "instructions") continue
+    body[k] = maskDeep(body[k], mask)
   }
-  if (typeof body.input === "string") body.input = mask(body.input)
-  else if (Array.isArray(body.input)) maskDeep(body.input, mask)
   return masked.n
 }
 
@@ -281,8 +288,18 @@ async function handle(req) {
   let bodyOut = null
   let maskedCount = 0
   const ct = (req.headers.get("content-type") || "").toLowerCase()
+  const clen = Number(req.headers.get("content-length") || 0)
+  if (clen > MAX_BODY) {
+    const r = failClosed(413, `请求体超过上限 ${MAX_BODY / 1048576}MB，未转发`, new Error(`content-length=${clen}`))
+    RES_INFO.set(r, { masked: 0, restore: 0 }); return r
+  }
   if ((method === "POST" || method === "PUT" || method === "PATCH") && ct.includes("json")) {
     const raw = await req.text()
+    if (Buffer.byteLength(raw, "utf8") > MAX_BODY) {
+      // 无 content-length 的分块请求：读到后才知大小（已在内存，仅拦截转发）
+      const r = failClosed(413, `请求体超过上限 ${MAX_BODY / 1048576}MB，未转发`, new Error("body too large"))
+      RES_INFO.set(r, { masked: 0, restore: 0 }); return r
+    }
     if (DEBUG && raw.trim()) console.error("[SF-proxy:debug] req.body(before)\n" + raw) // 掩码前明文
     if (raw.trim()) {
       let parsed
@@ -297,8 +314,16 @@ async function handle(req) {
       bodyOut = JSON.stringify(parsed)
       if (DEBUG) console.error("[SF-proxy:debug] req.body(after)\n" + bodyOut) // 掩码后实际发往上游
     } else bodyOut = raw
+  } else if (method === "POST" || method === "PUT" || method === "PATCH") {
+    // 带 body 但 content-type 非 JSON：无法保证脱敏，fail-closed 拒绝（脱敏工具不裸奔）。
+    const raw = await req.arrayBuffer()
+    if (raw.byteLength) {
+      const r = failClosed(415, "非 JSON 请求体无法脱敏，未转发", new Error(`content-type=${ct || "(空)"}`))
+      RES_INFO.set(r, { masked: 0, restore: 0 }); return r
+    }
+    bodyOut = raw // 空 body：透传
   } else {
-    bodyOut = await req.arrayBuffer() // 非 JSON（GET/二进制等）原样透传
+    bodyOut = await req.arrayBuffer() // GET/HEAD/DELETE 等无 body 方法
   }
 
   let upRes
@@ -348,6 +373,16 @@ function slog(method, pathname, status, extra) {
   console.error(`[SF-proxy] ${t} ${method} ${pathname} ${status}${extra ? " " + extra : ""}`)
 }
 
+// 慢客户端背压：write 返回 false 时等 drain；客户端提前断开时以 close/error 兜底放行，避免永久挂起。
+function drain(nodeRes) {
+  return new Promise((resolve) => {
+    const done = () => { nodeRes.off("drain", done); nodeRes.off("close", done); nodeRes.off("error", done); resolve() }
+    nodeRes.once("drain", done)
+    nodeRes.once("close", done)
+    nodeRes.once("error", done)
+  })
+}
+
 const server = createServer(async (nodeReq, nodeRes) => {
   // node:http → Web Request 适配：node/bun 通用（bun 亦实现 node:http）
   const scheme = nodeReq.socket.encrypted ? "https" : "http"
@@ -383,7 +418,7 @@ const server = createServer(async (nodeReq, nodeRes) => {
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        nodeRes.write(value)
+        if (!nodeRes.write(value)) await drain(nodeRes) // 慢客户端：等 drain，避免无界内存缓冲
       }
     }
     nodeRes.end()
@@ -393,13 +428,17 @@ const server = createServer(async (nodeReq, nodeRes) => {
   }
 })
 
-const HOST_ENV = process.env.SF_PROXY_HOST || ""
+// 默认只监听本机：代理无鉴权，监听通配网卡会让他人白嫖你的上游 key。
+// 需要对外（如容器/内网服务）时显式设 SF_PROXY_HOST，并在启动日志给醒目告警。
+const HOST_ENV = process.env.SF_PROXY_HOST || "127.0.0.1"
 const PORT_ENV = Number(process.env.SF_PROXY_PORT || 3141)
 server.listen(PORT_ENV, HOST_ENV || undefined)
 server.on("listening", () => {
   // 显示用 SF_PROXY_HOST（与 Bun.serve 的 hostname 语义一致）；未设则显示 localhost。
   // 测试从这行解析回调地址，必须是可连接形式，故不显示 ::/0.0.0.0 这类监听通配地址。
   const shown = HOST_ENV || "localhost"
+  const wildcard = HOST_ENV === "0.0.0.0" || HOST_ENV === "::" || HOST_ENV === ""
+  if (wildcard) console.error(`[SF-proxy] 警告：监听通配地址 ${HOST_ENV || "(全部接口)"}，代理无鉴权，同网段可访问你的上游凭据；仅应在本信网络使用`)
   const addr = server.address()
   console.error(`[SF-proxy] listening on http://${shown}:${typeof addr === "object" && addr ? addr.port : PORT_ENV} → ${process.env.SF_UPSTREAM || "https://api.openai.com/v1"}`)
 })
