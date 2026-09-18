@@ -1,10 +1,20 @@
 # sensitive-filter
 
-发给大模型前的本地敏感信息过滤 / Local sensitive-info filter before sending to LLMs
+发给大模型前的本地敏感信息过滤,当前支持直接运行、opencode、codex / Local sensitive-info filter before sending to LLMs
+
+**Reversible PII & secrets masking for LLM prompts** — CLI / OpenCode plugin / Codex reverse proxy. Zero dependency, fail-closed, sub-second.
 
 把日志/配置/代码/流量记录等内容发给云端大模型（或贴进上下文）**之前**，先在本地过一遍本工具。零依赖、秒级完成；装了 betterleaks 或 gitleaks 自动增强密钥识别（两者二选一，betterleaks 优先）。
 
 Run logs/config/code before pasting them into a cloud LLM (or your chat context). Zero dependencies, sub-second; betterleaks or gitleaks auto-enhances secret detection when installed (betterleaks takes precedence).
+
+## 特性 / Features
+
+- **可逆脱敏 reversible masking** — 身份证 / 手机号 / 银行卡 / 邮箱 / IPv4 / 各类 API 密钥替换为占位符，LLM 回复后 `--restore` 一键还原（PII masking, secrets redaction）
+- **fail-closed** — 任何环节异常即阻断发送，原文绝不外泄（never leaks raw text on error）
+- **零依赖 zero-dependency** — 纯 Python 或纯 Node.js 单文件，秒级完成（single file, sub-second）
+- **三种接入 three integrations** — CLI 管道、opencode 插件（自动掩码/还原）、Codex 反向代理
+- **密钥识别增强 secret detection** — 装了 betterleaks / gitleaks 自动补数百种厂商凭据格式（AWS / Stripe / GitHub / Slack / Google Cloud / GitLab 等）
 
 ## 脱敏 / Masking: 
 
@@ -89,7 +99,7 @@ cp opencode/plugins/sensitive-filter.ts .opencode/plugins/
 Codex 无原生请求改写钩子，通过本地反向代理接入：
 
 ```bash
-# 1. 启动代理（后台；node/bun 均可，node 需 ≥18）
+# 1. 启动代理（后台；node/bun 均可，node 需 ≥20）
 SF_UPSTREAM=https://your-upstream/v1 node codex/proxy.mjs
 
 # 2. config.toml 指向代理
@@ -113,9 +123,11 @@ SF_UPSTREAM=https://your-upstream/v1 node codex/proxy.mjs
 | `SF_MAP_DIR=目录` | 映射文件目录（CLI 用 `--map-out`） | 系统临时目录 |
 | `SF_MAP_KEEP=数量` | 映射保留上限（从最旧清理） | 5000 |
 | `SF_PROXY_PORT` | Codex 代理监听端口 | 3141 |
-| `SF_PROXY_HOST` | Codex 代理监听地址 | 全部接口 |
+| `SF_PROXY_HOST` | Codex 代理监听地址 | 仅本机 localhost（对外需显式设） |
 | `SF_UPSTREAM` | Codex 代理转发上游 | OpenAI 官方 |
 | `SF_PROXY_DEBUG=1` | Codex 代理调试日志（掩码前/后请求体、还原前/后响应，含明文，仅本地排障） | 关 |
+| `SF_PROXY_LOGFILE` | Codex 代理日志文件路径（等价 `--log-file`，stderr 照常输出，文件设 0600） | 仅 stderr |
+| `SF_MAX_BODY_MB` | Codex 代理请求体大小上限，超限 fail-closed 返回 413 | 64 |
 
 映射文件为 `sensitive_filter_map_<sha8>.json`（`{source_sha256, tokens}` 双向字典，仅存本地）。插件与 CLI 须指向**同一目录**才能互相还原（插件用 `SF_MAP_DIR`，CLI 用 `--map-out`）。
 
