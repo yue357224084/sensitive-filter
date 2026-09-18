@@ -1,9 +1,9 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 // codex/proxy.mjs — OpenAI Codex CLI（Responses API）前的本地脱敏反向代理。
 // 出站：请求体掩码 + instructions 注入敏感过滤指令；入站：SSE/JSON 响应还原。
 // 复用 sensitive-filter.mjs 核心（maskText/CATS/saveMap/enabledSet），gitleaks 层禁用。
 //
-// 用法: bun codex/proxy.mjs
+// 用法: node codex/proxy.mjs（bun 亦可；node 需 ≥20，fetch/Request/Response 为全局）
 // 环境变量:
 //   SF_PROXY_PORT 监听端口（默认 3141）   SF_PROXY_HOST 监听地址（默认全部接口；部署时设为目标内网 IP）
 //   SF_UPSTREAM   上游 base_url（默认 https://api.openai.com/v1）
@@ -11,7 +11,10 @@
 //   SF_OFF=1      代理直接退出        SF_ONLY / SF_SKIP 沿用 enabledSet() 语义
 //   SF_PROXY_DEBUG=1（或启动参数 --debug）
 //                 debug 日志：输出掩码前/后的请求体、响应还原前/后原文——含敏感明文，仅本地排障，勿外传日志
-import { readdirSync, readFileSync, statSync } from "node:fs"
+//   SF_PROXY_LOGFILE 日志文件路径（或启动参数 --log-file <path>）：所有 console.error 输出追加写入该文件
+//                 （stderr 照常输出；常配合 --debug 用，debug 内容含敏感明文，文件已设 0600，勿外传）
+import { appendFileSync, chmodSync, closeSync, openSync, readdirSync, readFileSync, statSync } from "node:fs"
+import { createServer } from "node:http"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -45,6 +48,19 @@ const SF_INSTRUCTION =
   "[sensitive-filter] 对话里的 [SECRET_n]/[IDCARD_n]/[PHONE_n]/[BANKCARD_n]/[EMAIL_n]/[IPV4_n] 是真实值的本地脱敏占位符：请原样保留引用、不要改写格式、不要编造原值；在 bash/写文件等工具参数里引用时也保持原样（工具执行前会自动还原为真值）。"
 
 const DEBUG = process.env.SF_PROXY_DEBUG === "1" || process.argv.includes("--debug")
+
+// --log-file <path>（或 SF_PROXY_LOGFILE）：包一层 console.error，stderr 照常输出的同时追加写文件
+const _li = process.argv.indexOf("--log-file")
+const _lv = _li >= 0 ? process.argv[_li + 1] : ""
+const LOGFILE = process.env.SF_PROXY_LOGFILE || (_lv && !_lv.startsWith("--") ? _lv : "") || ""
+if (LOGFILE) {
+  try { closeSync(openSync(LOGFILE, "a")); chmodSync(LOGFILE, 0o600) } catch { /* 建不出文件则后续 append 自行报错并被忽略 */ }
+  const orig = console.error.bind(console)
+  console.error = (...args) => {
+    orig(...args)
+    try { appendFileSync(LOGFILE, args.join(" ") + "\n") } catch { /* 磁盘满等，不影响代理转发 */ }
+  }
+}
 
 const CAT_RE = /^\[([A-Z][A-Z0-9]*)_(\d+)\]$/
 const TOKEN_STRIP = /\[(?:SECRET|IDCARD|PHONE|BANKCARD|EMAIL|IPV4)_\d+\]/g
@@ -141,28 +157,25 @@ function maskSlot(text, enabled, masked) {
   return o
 }
 
-// 掩码 Responses API 结构：顶层 instructions（字符串）与 input（字符串或 items 数组）。
-// item.content 可能是 string 或 [{type:"input_text"|"output_text"|"text", text:...}]。
+// 掩码 Responses API 结构：顶层 instructions（字符串）与 input（递归所有字符串）。
+// input item 的文本可能落在 content[].text（message）、output（function_call_output）、
+// arguments（function_call）等不同字段；逐字段列举曾漏掉 output/arguments 导致明文外发，
+// 故对 input 整体递归——maskText 只命中固定格式，对 type/id/call_id 等元数据无副作用，且幂等。
+function maskDeep(v, mask) {
+  if (typeof v === "string") return mask(v)
+  if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) v[i] = maskDeep(v[i], mask); return v }
+  if (v && typeof v === "object") { for (const k of Object.keys(v)) v[k] = maskDeep(v[k], mask); return v }
+  return v
+}
+
 function maskRequestBody(body) {
   const masked = { n: 0 }
   const mask = (t) => maskSlot(t, enabled, masked)
   if (typeof body.instructions === "string" && body.instructions.trim()) {
     body.instructions = mask(body.instructions) + "\n\n" + SF_INSTRUCTION
   }
-  if (typeof body.input === "string") {
-    body.input = mask(body.input)
-  } else if (Array.isArray(body.input)) {
-    for (let i = 0; i < body.input.length; i++) {
-      const it = body.input[i]
-      if (typeof it === "string") { body.input[i] = mask(it); continue }
-      if (it && typeof it === "object") {
-        if (typeof it.content === "string") it.content = mask(it.content)
-        else if (Array.isArray(it.content)) {
-          for (const c of it.content) if (c && typeof c.text === "string") c.text = mask(c.text)
-        } else if (typeof it.text === "string") it.text = mask(it.text)
-      }
-    }
-  }
+  if (typeof body.input === "string") body.input = mask(body.input)
+  else if (Array.isArray(body.input)) maskDeep(body.input, mask)
   return masked.n
 }
 
@@ -227,13 +240,11 @@ async function* sseRestoreStream(body, counts) {
       }
     }
   } catch (e) {
-    console.error(`[SF-proxy] 入站 SSE 处理失败，透传剩余流: ${e && (e.message || e)}`)
+    // 上游流中断（ECONNRESET 等）后 reader 已进入错误态：再 read() 会立刻抛出同一个异常，
+    // 该异常从 generator 冒泡到 createServer 写入循环 → unhandled rejection → 进程退出（曾实测）。
+    // 上游断了就没有"剩余流"可透传，此处只冲刷已缓冲字节即结束。
+    console.error(`[SF-proxy] 入站 SSE 处理失败，上游流中断: ${e && (e.message || e)}`)
     if (tail.length) yield tail.toString("utf8")
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      yield value
-    }
     return
   }
   if (tail.length) yield restoreText(tail.toString("utf8"), counts) // 流结束：冲刷尾缓冲
@@ -337,22 +348,58 @@ function slog(method, pathname, status, extra) {
   console.error(`[SF-proxy] ${t} ${method} ${pathname} ${status}${extra ? " " + extra : ""}`)
 }
 
-const server = Bun.serve({
-  hostname: process.env.SF_PROXY_HOST || "",
-  port: Number(process.env.SF_PROXY_PORT || 3141),
-  async fetch(req) {
-    const method = req.method
-    const pathname = new URL(req.url).pathname
-    const t0 = Date.now()
-    try {
-      const res = await handle(req)
-      const info = RES_INFO.get(res)
-      slog(method, pathname, res.status, `(${Date.now() - t0}ms) mask=${info?.masked ?? 0} restore=${info?.restore ?? 0}`)
-      return res
-    } catch (e) {
-      slog(method, pathname, 500)
-      return failClosed(500, "代理内部错误", e)
+const server = createServer(async (nodeReq, nodeRes) => {
+  // node:http → Web Request 适配：node/bun 通用（bun 亦实现 node:http）
+  const scheme = nodeReq.socket.encrypted ? "https" : "http"
+  const url = `${scheme}://${nodeReq.headers.host || "localhost"}${nodeReq.url}`
+  const headers = new Headers()
+  for (const [k, v] of Object.entries(nodeReq.headers)) {
+    if (v === undefined) continue
+    for (const item of Array.isArray(v) ? v : [v]) headers.append(k, item)
+  }
+  const hasBody = !["GET", "HEAD"].includes(nodeReq.method || "")
+  const req = new Request(url, {
+    method: nodeReq.method,
+    headers,
+    body: hasBody ? ReadableStream.from(nodeReq) : undefined,
+    duplex: "half",
+  })
+  let res
+  const t0 = Date.now()
+  try {
+    res = await handle(req)
+    const info = RES_INFO.get(res)
+    slog(nodeReq.method || "", new URL(req.url).pathname, res.status, `(${Date.now() - t0}ms) mask=${info?.masked ?? 0} restore=${info?.restore ?? 0}`)
+  } catch (e) {
+    slog(nodeReq.method || "", nodeReq.url || "/", 500)
+    res = failClosed(500, "代理内部错误", e)
+  }
+  const resHeaders = {}
+  for (const [k, v] of res.headers) resHeaders[k] = v
+  try {
+    nodeRes.writeHead(res.status, resHeaders)
+    if (res.body) {
+      const reader = res.body.getReader()
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        nodeRes.write(value)
+      }
     }
-  },
+    nodeRes.end()
+  } catch {
+    // 客户端断开或上游中断：socket 已不可用，静默收尾，避免 unhandled rejection 终止进程
+    try { nodeRes.destroy() } catch {}
+  }
 })
-console.error(`[SF-proxy] listening on http://${server.hostname}:${server.port} → ${process.env.SF_UPSTREAM || "https://api.openai.com/v1"}`)
+
+const HOST_ENV = process.env.SF_PROXY_HOST || ""
+const PORT_ENV = Number(process.env.SF_PROXY_PORT || 3141)
+server.listen(PORT_ENV, HOST_ENV || undefined)
+server.on("listening", () => {
+  // 显示用 SF_PROXY_HOST（与 Bun.serve 的 hostname 语义一致）；未设则显示 localhost。
+  // 测试从这行解析回调地址，必须是可连接形式，故不显示 ::/0.0.0.0 这类监听通配地址。
+  const shown = HOST_ENV || "localhost"
+  const addr = server.address()
+  console.error(`[SF-proxy] listening on http://${shown}:${typeof addr === "object" && addr ? addr.port : PORT_ENV} → ${process.env.SF_UPSTREAM || "https://api.openai.com/v1"}`)
+})

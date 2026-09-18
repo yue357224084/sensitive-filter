@@ -89,8 +89,8 @@ cp opencode/plugins/sensitive-filter.ts .opencode/plugins/
 Codex 无原生请求改写钩子，通过本地反向代理接入：
 
 ```bash
-# 1. 启动代理（后台）
-SF_UPSTREAM=https://your-upstream/v1 bun codex/proxy.mjs
+# 1. 启动代理（后台；node/bun 均可，node 需 ≥18）
+SF_UPSTREAM=https://your-upstream/v1 node codex/proxy.mjs
 
 # 2. config.toml 指向代理
 # [model_providers.openaig]
@@ -100,6 +100,8 @@ SF_UPSTREAM=https://your-upstream/v1 bun codex/proxy.mjs
 ```
 
 代理出站掩码 `instructions`/`input` + 注入占位符指令 + 确定性持久映射（与 CLI/插件互操作）；入站 SSE 跨 chunk 还原 + JSON 递归还原。
+
+排障：`--debug`（等价 `SF_PROXY_DEBUG=1`）输出掩码/还原前后的明文请求与响应；`--log-file <路径>`（等价 `SF_PROXY_LOGFILE`）把日志追加写入文件（含 debug 明文，文件设 0600，勿外传）。
 
 ## 开关配置 / Configuration  --均可在.env配置中修改
 

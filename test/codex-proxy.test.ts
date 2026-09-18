@@ -3,7 +3,7 @@
 // 断言：出站掩码 + instructions 注入 / 确定性编号 / SSE 跨 chunk 拆分还原 / JSON 递归还原 / SF_SKIP。
 // 注意：占位符一律运行时拼接（T 助手 / 字符串分段），源码不写字面真值，注释只用 [SECRET_n] 形（无数字）。
 import { afterEach, describe, expect, test } from "bun:test"
-import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createHash } from "node:crypto"
@@ -249,5 +249,98 @@ describe("codex proxy", () => {
     expect(err).toContain("[SF-proxy:debug] res.json(after)")
     expect(err).toMatch(/mask=[1-9]/) // 常规日志：掩了 1+ 处
     expect(err).toMatch(/restore=[1-9]/) // 常规日志：还原了 1+ 处
+  })
+
+  test("(g) SF_PROXY_LOGFILE：console.error 输出（含 debug）追加落盘", async () => {
+    const logDir = mkdtempSync(join(tmpdir(), "sf_proxy_log_"))
+    maps.push(logDir)
+    const logFile = join(logDir, "proxy.log")
+    const mock = startMock((raw) => Response.json(JSON.parse(raw)))
+    const proxy = await startProxy(mock.url, { SF_PROXY_DEBUG: "1", SF_PROXY_LOGFILE: logFile })
+    const res = await fetch(proxy.url + "/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ input: [{ role: "user", content: [{ type: "input_text", text: "key=" + SK_KEY }] }] }),
+    })
+    expect(res.status).toBe(200)
+    await Bun.sleep(100) // 等最后一行访问日志刷进文件
+    const log = readFileSync(logFile, "utf8")
+    expect(log).toContain("listening on") // 启动行也进文件
+    expect(log).toContain("[SF-proxy:debug] req.body(before)") // debug 明文进文件
+    expect(log).toContain("[SF-proxy:debug] res.json(after)")
+    expect(log).toMatch(/mask=[1-9]/) // 访问日志行进文件
+    mock.stop()
+  })
+
+  test("(h) function_call_output.output / function_call.arguments 也掩码与还原（曾漏字段致明文外发）", async () => {
+    const mock = startMock((raw) => Response.json(JSON.parse(raw))) // 回显已掩码 body，供还原层验证
+    const proxy = await startProxy(mock.url)
+
+    const HEX32 = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+    const connStr = "amqp://" + "svc:p4ssw0rd" + "@" + HOST + ":5672/vh"
+    const res = await fetch(proxy.url + "/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        input: [
+          { type: "function_call_output", call_id: "call_1", output: JSON.stringify({ DesSecretKey: HEX32, Connection: connStr }) },
+          { type: "function_call", call_id: "call_2", name: "exec_command", arguments: JSON.stringify({ cmd: "curl -H 'Authorization: Bearer " + SK_KEY + "' http://" + HOST + "/" }) },
+        ],
+      }),
+    })
+    expect(res.status).toBe(200)
+
+    // 出站：这两个字段的敏感值都已掩码（修复前 mask=0，明文外发）
+    const sent = mock.bodies[0]
+    expect(sent).not.toContain(HEX32)
+    expect(sent).not.toContain("p4ssw0rd")
+    expect(sent).not.toContain(SK_KEY)
+    expect(sent).toContain(T("SECRET", 1))
+    expect(proxy.getErr()).toMatch(/mask=[1-9]/) // 访问日志：确实掩了
+
+    // 入站：占位符还原回真值
+    const got = await res.json()
+    expect(JSON.parse(got.input[0].output).DesSecretKey).toBe(HEX32)
+    expect(JSON.parse(got.input[0].output).Connection).toBe(connStr)
+    expect(JSON.parse(got.input[1].arguments).cmd).toContain(SK_KEY)
+    mock.stop()
+  })
+
+  test("(i) 上游 SSE 中途断连：代理不退出（不重读已损坏 reader），后续请求正常", async () => {
+    let n = 0
+    const mock = startMock(() => {
+      n++
+      if (n === 1) {
+        const sse = new ReadableStream({
+          start(c) {
+            c.enqueue(enc.encode("data: {\"t\":\"partial\"}\n\n"))
+            // 响应建立后再中断：同步 error 会让 fetch(upstream) 直接 reject 走 502 分支，测不到 SSE 流内断连
+            setTimeout(() => c.error(new Error("socket closed")), 50) // 模拟上游中途 ECONNRESET
+          },
+        })
+        return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } })
+      }
+      return Response.json({ ok: true })
+    })
+    const proxy = await startProxy(mock.url)
+
+    // 第一次：上游流中断（客户端侧可能也断，属预期）
+    try {
+      const r1 = await fetch(proxy.url + "/v1/responses", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ input: "x" }),
+      })
+      await r1.text()
+    } catch { /* 客户端侧断开属预期 */ }
+    await Bun.sleep(300) // 等错误日志刷进 errLog
+
+    expect(proxy.getErr()).toContain("入站 SSE 处理失败") // 走了兜底分支
+
+    // 第二次：代理仍存活并正常服务（修复前此处因 unhandled rejection 已进程退出）
+    const res2 = await fetch(proxy.url + "/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ input: "y" }),
+    })
+    expect(res2.status).toBe(200)
+    expect(await res2.json()).toEqual({ ok: true })
+    mock.stop()
   })
 })
