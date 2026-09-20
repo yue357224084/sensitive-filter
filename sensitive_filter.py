@@ -73,6 +73,29 @@ def luhn_ok(s: str) -> bool:
         return False
 
 
+def ipv4_ok(s: str) -> bool:
+    """私网 IPv4 默认豁免（SF_MASK_PRIVATE_IP=1 时恢复掩码）。
+
+    内网段: 10/8、172.16/12、192.168/16、127/8、169.254/16、100.64/10 CGNAT；
+    RFC 5737 测试段(192.0.2/24 等)不豁免。env 每次调用读取，运行时开关可变。
+    """
+    if os.environ.get("SF_MASK_PRIVATE_IP") == "1":
+        return True
+    try:
+        a, b, _, _ = (int(x) for x in s.split("."))
+    except ValueError:
+        return True
+    is_private = (
+        a == 10
+        or (a == 172 and 16 <= b <= 31)
+        or (a == 192 and b == 168)
+        or a == 127
+        or (a == 169 and b == 254)
+        or (a == 100 and 64 <= b <= 127)
+    )
+    return not is_private
+
+
 # ---------------------------------------------------------------- C 层规则
 # 顺序即优先级：先命中的 span 占位，后续类别跳过重叠区域。
 # 元组: (类别名, 正则, 校验函数|None, 要掩码的 group 序号)
@@ -115,10 +138,45 @@ _CATS = [
     ("phone", r"(?<!\d)1[3-9]\d{9}(?!\d)", None, 0),
     ("bankcard", r"(?<!\d)\d{16,19}(?!\d)", luhn_ok, 0),
     ("email", r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", None, 0),
-    ("ipv4", r"(?<![\d.])(?<![A-Za-z0-9]\/)((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])", None, 0),
+    ("ipv4", r"(?<![\d.])(?<![A-Za-z0-9]\/)((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])", ipv4_ok, 0),
 ]
 
 _SKIP_VALUES = {"none", "null", "true", "false", "undefined", "changeme", "change-me", "todo"}
+
+
+# ---------------------------------------------------------------- 运行时规则组装（SF_MASK_VALUES / SF_MASK_KEYS）
+# 空配置时返回与 _CATS 逐字节等价的正则（不替换、不重编译）。
+
+_MASK_WARNED_SHORT = set()
+
+
+def _warn_short_value(v: str) -> None:
+    if v not in _MASK_WARNED_SHORT:
+        _MASK_WARNED_SHORT.add(v)
+        sys.stderr.write(f"[警告] SF_MASK_VALUES 忽略过短(<4)值: {v}\n")
+
+
+def _build_cats() -> list:
+    """SF_MASK_VALUES 字面值规则插到最前（SECRET 类、优先级最高）；
+    SF_MASK_KEYS 键名并入现有两条键名赋值规则的 alternation（键值形态匹配，只掩 group 1 值、键名保留）。"""
+    vals = [v.strip() for v in os.environ.get("SF_MASK_VALUES", "").split(",") if v.strip()]
+    keys = [k.strip() for k in os.environ.get("SF_MASK_KEYS", "").split(",") if k.strip()]
+    cats = []
+    for v in vals:
+        if len(v) < 4:
+            _warn_short_value(v)
+            continue
+        # 插到最前：用户显式配置优先级最高；\w 边界防子串误命中（如 1111 命中 111111）
+        cats.append(("secret", rf"(?<![\w])(?:{re.escape(v)})(?![\w])", None, 0))
+    if not vals and not keys:
+        return list(_CATS)
+    for cat, pattern, valid, grp in _CATS:
+        if keys and grp == 1 and "passw(?:or)?d" in pattern:
+            # 识别条件：含键名关键词且 grp==1 的恰是两条键名赋值规则（URL userinfo 等 grp==1 规则不含关键词，不受影响）
+            alt = "|".join(re.escape(k) for k in keys)
+            pattern = pattern.replace("(?:passw(?:or)?d|", f"(?:passw(?:or)?d|{alt}|", 1)
+        cats.append((cat, pattern, valid, grp))
+    return cats
 
 
 class Session:
@@ -141,7 +199,7 @@ class Session:
 
 
 def c_layer(text: str, sess: Session, enabled: set):
-    for cat, pattern, valid, grp in _CATS:
+    for cat, pattern, valid, grp in _build_cats():
         if cat not in enabled:
             continue
         for m in re.finditer(pattern, text):
@@ -181,10 +239,14 @@ def scanner_layer(text: str, sess: Session):
     try:
         (tmpdir / "input.txt").write_text(text, encoding="utf-8")
         rep = tmpdir / "rep.json"
+        try:
+            _to = max(1, int(os.environ.get("SF_SCANNER_TIMEOUT", "30")))
+        except ValueError:
+            _to = 30
         r = subprocess.run(
             [exe, "dir", str(tmpdir), "--no-banner", "--exit-code", "0",
              "--report-path", str(rep), "--report-format", "json"],
-            capture_output=True, timeout=120)
+            capture_output=True, timeout=_to)
         leaks = []
         if rep.exists() and rep.read_text(encoding="utf-8").strip():
             leaks = json.loads(rep.read_text(encoding="utf-8"))
@@ -192,10 +254,18 @@ def scanner_layer(text: str, sess: Session):
         for leak in leaks:
             val = (leak.get("Secret") or leak.get("secret") or leak.get("Match") or leak.get("match") or "").strip()
             if val:
-                idx = text.find(val)
-                if idx >= 0 and sess.free(idx, idx + len(val)):
-                    sess.take(idx, idx + len(val), "secret", val)
-                    taken += 1
+                # 遍历所有出现位置，取第一个未被 c_layer 占用的 span 掩码；
+                # 只定位首次出现会掩到早处、真值残留（find 早处已被占则继续找下一个）
+                pos = 0
+                while True:
+                    idx = text.find(val, pos)
+                    if idx < 0:
+                        break
+                    if sess.free(idx, idx + len(val)):
+                        sess.take(idx, idx + len(val), "secret", val)
+                        taken += 1
+                        break
+                    pos = idx + 1
         return f"{scanner}: 补掩 {taken}/{len(leaks)}" if leaks else f"{scanner}: 无命中"
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         return f"跳过({type(exc).__name__})"
@@ -333,6 +403,48 @@ def run_selftest() -> int:
         ("idcard/bankcard 不重复掩码", out.count("[IDCARD_") == 1 and out.count("[BANKCARD_") == 1),
         ("🔴 值==关键词: 值掩码/关键词保留", '"password"' not in out and "password:" in out and not re.search(r"\[SECRET_\d+\]:", out) and has("password", "SECRET")),
         ("还原闭环", do_restore(out, str(save_map(sess.mapping, out, None))) == sample),
+    ]
+
+    # 新功能自检（独立小样本 + 临时 env，try/finally 恢复；上方主 sample 调用不受影响）
+    mask_envs = ("SF_MASK_PRIVATE_IP", "SF_MASK_VALUES", "SF_MASK_KEYS")
+    saved_env = {k: os.environ.get(k) for k in mask_envs}
+    try:
+        for k in mask_envs:
+            os.environ.pop(k, None)
+
+        def has_in(s, v, c):
+            return s.mapping.get(v, "").startswith("[" + c + "_")
+
+        priv_ip = "192" + ".168" + ".1" + ".1"
+        o1, s1, _ = mask_text(f"gw {priv_ip}", {c for c, *_ in _CATS}, use_gitleaks=False)
+        private_exempt = priv_ip in o1 and not has_in(s1, priv_ip, "IPV4")
+
+        os.environ["SF_MASK_PRIVATE_IP"] = "1"
+        o2, s2, _ = mask_text(f"gw {priv_ip}", {c for c, *_ in _CATS}, use_gitleaks=False)
+        private_masked = priv_ip not in o2 and has_in(s2, priv_ip, "IPV4")
+        os.environ.pop("SF_MASK_PRIVATE_IP")
+
+        custom_val = "77" + "77" + "77"
+        os.environ["SF_MASK_VALUES"] = custom_val
+        o3, s3, _ = mask_text(f"v {custom_val}", {c for c, *_ in _CATS}, use_gitleaks=False)
+        values_masked = custom_val not in o3 and has_in(s3, custom_val, "SECRET")
+        os.environ.pop("SF_MASK_VALUES")
+
+        os.environ["SF_MASK_KEYS"] = "pss"
+        o4, s4, _ = mask_text("pss=abc123", {c for c, *_ in _CATS}, use_gitleaks=False)
+        keys_masked = "pss=" in o4 and "abc123" not in o4 and has_in(s4, "abc123", "SECRET")
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    checks += [
+        ("私网 IPv4 默认豁免(192.168.1.1 保留)", private_exempt),
+        ("SF_MASK_PRIVATE_IP=1 私网掩码", private_masked),
+        ("SF_MASK_VALUES 自定义值掩码(777777→SECRET)", values_masked),
+        ("SF_MASK_KEYS 自定义键掩值/键保留(pss=abc123)", keys_masked),
     ]
     ok = True
     for name, passed in checks:

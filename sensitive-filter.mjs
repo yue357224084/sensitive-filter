@@ -65,6 +65,25 @@ function luhnOk(s) {
   }
 }
 
+function ipv4Ok(s) {
+  // 私网 IPv4 默认豁免（SF_MASK_PRIVATE_IP=1 时恢复掩码）。
+  // 内网段: 10/8、172.16/12、192.168/16、127/8、169.254/16、100.64/10 CGNAT；
+  // RFC 5737 测试段(192.0.2/24 等)不豁免。env 每次调用读取，运行时开关可变。
+  if (process.env.SF_MASK_PRIVATE_IP === "1") return true
+  const p = s.split(".").map((x) => parseInt(x, 10))
+  const a = p[0]
+  const b = p[1]
+  if (Number.isNaN(a) || Number.isNaN(b)) return true
+  const isPrivate =
+    a === 10 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    a === 127 ||
+    (a === 169 && b === 254) ||
+    (a === 100 && b >= 64 && b <= 127)
+  return !isPrivate
+}
+
 // ---------------------------------------------------------------- C 层规则
 // 顺序即优先级：先命中的 span 占位，后续类别跳过重叠区域。
 // 元组: [类别名, 正则, 校验函数|null, 要掩码的 group 序号]
@@ -109,10 +128,48 @@ const CATS = [
   ["phone", /(?<!\d)1[3-9]\d{9}(?!\d)/g, null, 0],
   ["bankcard", /(?<!\d)\d{16,19}(?!\d)/g, luhnOk, 0],
   ["email", /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, null, 0],
-  ["ipv4", /(?<![\d.])(?<![A-Za-z0-9]\/)((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])/g, null, 0],
+  ["ipv4", /(?<![\d.])(?<![A-Za-z0-9]\/)((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])/g, ipv4Ok, 0],
 ]
 
 const SKIP_VALUES = new Set(["none", "null", "true", "false", "undefined", "changeme", "change-me", "todo"])
+
+// ---------------------------------------------------------------- 运行时规则组装（SF_MASK_VALUES / SF_MASK_KEYS）
+// 空配置时返回 CATS 本身（不替换、不重编译，与现状逐字节一致）。
+
+const MASK_WARNED_SHORT = new Set()
+
+function escapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function warnShortValue(v) {
+  if (!MASK_WARNED_SHORT.has(v)) {
+    MASK_WARNED_SHORT.add(v)
+    process.stderr.write(`[警告] SF_MASK_VALUES 忽略过短(<4)值: ${v}\n`)
+  }
+}
+
+function buildCats() {
+  const vals = (process.env.SF_MASK_VALUES || "").split(",").map((s) => s.trim()).filter(Boolean)
+  const keys = (process.env.SF_MASK_KEYS || "").split(",").map((s) => s.trim()).filter(Boolean)
+  const cats = []
+  for (const v of vals) {
+    if (v.length < 4) { warnShortValue(v); continue }
+    // 插到最前：用户显式配置优先级最高；\w 边界防子串误命中（如 1111 命中 111111）
+    cats.push(["secret", new RegExp(`(?<![\\w])(?:${escapeRe(v)})(?![\\w])`, "g"), null, 0])
+  }
+  if (!vals.length && !keys.length) return CATS
+  for (const [cat, re, valid, grp] of CATS) {
+    if (keys.length && grp === 1 && re.source.includes("passw(?:or)?d")) {
+      // 识别条件：含键名关键词且 grp==1 的恰是两条键名赋值规则（URL userinfo 等 grp==1 规则不含关键词，不受影响）
+      const alt = keys.map(escapeRe).join("|")
+      cats.push([cat, new RegExp(re.source.replace("(?:passw(?:or)?d|", `(?:passw(?:or)?d|${alt}|`), re.flags), valid, grp])
+    } else {
+      cats.push([cat, re, valid, grp])
+    }
+  }
+  return cats
+}
 
 // ---------------------------------------------------------------- Session
 
@@ -139,7 +196,7 @@ class Session {
 }
 
 function cLayer(text, sess, enabled) {
-  for (const [cat, re, valid, grp] of CATS) {
+  for (const [cat, re, valid, grp] of buildCats()) {
     if (!enabled.has(cat)) continue
     for (const m of text.matchAll(re)) {
       const val = m[grp]
@@ -189,7 +246,7 @@ function scannerLayer(text, sess) {
       exe,
       ["dir", dir, "--no-banner", "--exit-code", "0",
         "--report-path", rep, "--report-format", "json"],
-      { shell: false, encoding: "utf8", timeout: 120000, maxBuffer: 64 * 1024 * 1024 },
+      { shell: false, encoding: "utf8", timeout: (Number(process.env.SF_SCANNER_TIMEOUT) || 30) * 1000, maxBuffer: 64 * 1024 * 1024 },
     )
     let leaks = []
     if (r.error) throw r.error
@@ -200,10 +257,16 @@ function scannerLayer(text, sess) {
     for (const leak of leaks) {
       const val = (leak.Secret || leak.secret || leak.Match || leak.match || "").toString().trim()
       if (val) {
-        const idx = text.indexOf(val)
-        if (idx >= 0 && sess.free(idx, idx + val.length)) {
-          sess.take(idx, idx + val.length, "secret", val)
-          taken++
+        // 遍历所有出现位置，取第一个未被 c_layer 占用的 span 掩码；
+        // 只定位首次出现会掩到早处、真值残留（indexOf 早处已被占则继续找下一个）
+        let pos = 0, idx
+        while ((idx = text.indexOf(val, pos)) >= 0) {
+          if (sess.free(idx, idx + val.length)) {
+            sess.take(idx, idx + val.length, "secret", val)
+            taken++
+            break
+          }
+          pos = idx + 1
         }
       }
     }
@@ -389,6 +452,40 @@ function runSelfTest() {
     ["🔴 值==关键词: 值掩码/关键词保留", !out.includes('"password"') && out.includes("password:") && !/\[SECRET_\d+\]:/.test(out) && has("password", "SECRET")],
     ["还原闭环", doRestore(out, mapFile) === sample],
   ]
+  // 新功能自检（独立小样本 + 临时 env，try/finally 恢复；上方主 sample 调用不受影响）
+  const maskEnvKeys = ["SF_MASK_PRIVATE_IP", "SF_MASK_VALUES", "SF_MASK_KEYS"]
+  const savedEnv = Object.fromEntries(maskEnvKeys.map((k) => [k, process.env[k]]))
+  const hasIn = (s, v, c) => (s.mapping[v] || "").startsWith("[" + c + "_")
+  let privateExempt, privateMasked, valuesMasked, keysMasked
+  try {
+    for (const k of maskEnvKeys) delete process.env[k]
+    const privIp = "192" + ".168" + ".1" + ".1"
+    const r1 = maskText("gw " + privIp, new Set(CATS.map((c) => c[0])), false)
+    privateExempt = r1.out.includes(privIp) && !hasIn(r1.sess, privIp, "IPV4")
+    process.env.SF_MASK_PRIVATE_IP = "1"
+    const r2 = maskText("gw " + privIp, new Set(CATS.map((c) => c[0])), false)
+    privateMasked = !r2.out.includes(privIp) && hasIn(r2.sess, privIp, "IPV4")
+    delete process.env.SF_MASK_PRIVATE_IP
+    const customVal = "77" + "77" + "77"
+    process.env.SF_MASK_VALUES = customVal
+    const r3 = maskText("v " + customVal, new Set(CATS.map((c) => c[0])), false)
+    valuesMasked = !r3.out.includes(customVal) && hasIn(r3.sess, customVal, "SECRET")
+    delete process.env.SF_MASK_VALUES
+    process.env.SF_MASK_KEYS = "pss"
+    const r4 = maskText("pss=abc123", new Set(CATS.map((c) => c[0])), false)
+    keysMasked = r4.out.includes("pss=") && !r4.out.includes("abc123") && hasIn(r4.sess, "abc123", "SECRET")
+  } finally {
+    for (const k of maskEnvKeys) {
+      if (savedEnv[k] === undefined) delete process.env[k]
+      else process.env[k] = savedEnv[k]
+    }
+  }
+  checks.push(
+    ["私网 IPv4 默认豁免(192.168.1.1 保留)", privateExempt],
+    ["SF_MASK_PRIVATE_IP=1 私网掩码", privateMasked],
+    ["SF_MASK_VALUES 自定义值掩码(777777→SECRET)", valuesMasked],
+    ["SF_MASK_KEYS 自定义键掩值/键保留(pss=abc123)", keysMasked],
+  )
   let ok = true
   for (const [name, passed] of checks) {
     console.log(`  ${passed ? "PASS" : "FAIL"}  ${name}`)

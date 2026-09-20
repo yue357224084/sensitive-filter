@@ -126,6 +126,12 @@ if __name__ == "__main__":
     ip1 = "192" + ".0" + ".2" + ".1"
     ip2 = "198" + ".51" + ".100" + ".7"
     ip3 = "203" + ".0" + ".113" + ".9"
+    # 私网段（默认豁免；SF_MASK_PRIVATE_IP=1 时掩码）：10/8、172.16/12、100.64/10 CGNAT
+    ip4 = "10" + ".0" + ".0" + ".1"
+    ip5 = "172" + ".16" + ".0" + ".1"
+    ip6 = "100" + ".64" + ".0" + ".1"
+    # 自定义字面值 / 自定义键名（SF_MASK_VALUES / SF_MASK_KEYS 生效时掩码）
+    custom_literal = "77" + "77" + "77"
 
     sample = (
         "===== parity sample (all values fake) =====\n"
@@ -134,6 +140,8 @@ if __name__ == "__main__":
         f"card1={card1} card2={card2}\n"
         f"mail1={fake_mail1} mail2={fake_mail2}\n"
         f"ip1={ip1} ip2={ip2} ip3={ip3}\n"
+        f"ip4={ip4} ip5={ip5} ip6={ip6} (private, exempt by default)\n"
+        f"pss={custom_literal} v={custom_literal}\n"
         f"sk1={sk(32)} sk2={pk(32)}\n"
         f"ghp={ghp(40)} xox={xox(20)} akia=AKIAIOSFODNN7EXAMPLE\n"
         f"jwt={jwt()}\n"

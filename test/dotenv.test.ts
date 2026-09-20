@@ -13,7 +13,7 @@ const ROOT = join(import.meta.dir, "..")
 const HOST = "127" + ".0.0" + ".1"
 const T = (c: string, n: number) => "[" + c + "_" + n + "]"
 const PHONE = "1390000" + "0001"
-const IP = "10.0.0." + "1"
+const IP = "192.0.2." + "1" // RFC 5737 测试段：非私网（私网 IPv4 现默认豁免，此处只当"ipv4 是否生效"标记）
 const SK = "sk-" + "AbCdEf" + "0123456789AbCdEf0123456789"
 const MAIL = "user" + "@" + "example" + ".com"
 

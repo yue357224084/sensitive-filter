@@ -226,6 +226,25 @@ function luhnOk(s: string): boolean {
   }
 }
 
+function ipv4Ok(s: string): boolean {
+  // 私网 IPv4 默认豁免（SF_MASK_PRIVATE_IP=1 时恢复掩码）。
+  // 内网段: 10/8、172.16/12、192.168/16、127/8、169.254/16、100.64/10 CGNAT；
+  // RFC 5737 测试段(192.0.2/24 等)不豁免。env 每次调用读取，运行时开关可变。
+  if (process.env.SF_MASK_PRIVATE_IP === "1") return true
+  const p = s.split(".").map((x) => parseInt(x, 10))
+  const a = p[0]
+  const b = p[1]
+  if (Number.isNaN(a) || Number.isNaN(b)) return true
+  const isPrivate =
+    a === 10 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    a === 127 ||
+    (a === 169 && b === 254) ||
+    (a === 100 && b >= 64 && b <= 127)
+  return !isPrivate
+}
+
 // ---- C 层规则 ----
 // 顺序即优先级：先命中的 span 占位，后续类别跳过重叠区域。
 // 元组: [类别名, 正则, 校验函数|null, 要掩码的 group 序号]
@@ -270,10 +289,47 @@ const CATS: [string, RegExp, ((s: string) => boolean) | null, number][] = [
   ["phone", /(?<!\d)1[3-9]\d{9}(?!\d)/g, null, 0],
   ["bankcard", /(?<!\d)\d{16,19}(?!\d)/g, luhnOk, 0],
   ["email", /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, null, 0],
-  ["ipv4", /(?<![\d.])(?<![A-Za-z0-9]\/)((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])/g, null, 0],
+  ["ipv4", /(?<![\d.])(?<![A-Za-z0-9]\/)((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])/g, ipv4Ok, 0],
 ]
 
 const SKIP_VALUES = new Set(["none", "null", "true", "false", "undefined", "changeme", "change-me", "todo"])
+
+// ---- 运行时规则组装（SF_MASK_VALUES / SF_MASK_KEYS；空配置返回 CATS 本身，不替换、不重编译）----
+
+const MASK_WARNED_SHORT = new Set<string>()
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function warnShortValue(v: string): void {
+  if (!MASK_WARNED_SHORT.has(v)) {
+    MASK_WARNED_SHORT.add(v)
+    process.stderr.write(`[警告] SF_MASK_VALUES 忽略过短(<4)值: ${v}\n`)
+  }
+}
+
+function buildCats(): [string, RegExp, ((s: string) => boolean) | null, number][] {
+  const vals = (process.env.SF_MASK_VALUES || "").split(",").map((s) => s.trim()).filter(Boolean)
+  const keys = (process.env.SF_MASK_KEYS || "").split(",").map((s) => s.trim()).filter(Boolean)
+  const cats: [string, RegExp, ((s: string) => boolean) | null, number][] = []
+  for (const v of vals) {
+    if (v.length < 4) { warnShortValue(v); continue }
+    // 插到最前：用户显式配置优先级最高；\w 边界防子串误命中（如 1111 命中 111111）
+    cats.push(["secret", new RegExp(`(?<![\\w])(?:${escapeRe(v)})(?![\\w])`, "g"), null, 0])
+  }
+  if (!vals.length && !keys.length) return CATS
+  for (const [cat, re, valid, grp] of CATS) {
+    if (keys.length && grp === 1 && re.source.includes("passw(?:or)?d")) {
+      // 识别条件：含键名关键词且 grp==1 的恰是两条键名赋值规则（URL userinfo 等 grp==1 规则不含关键词，不受影响）
+      const alt = keys.map((k) => escapeRe(k)).join("|")
+      cats.push([cat, new RegExp(re.source.replace("(?:passw(?:or)?d|", `(?:passw(?:or)?d|${alt}|`), re.flags), valid, grp])
+    } else {
+      cats.push([cat, re, valid, grp])
+    }
+  }
+  return cats
+}
 
 // ---- Session：一次掩码运行的共享状态 ----
 
@@ -298,7 +354,7 @@ class Session {
 }
 
 function cLayer(text: string, sess: Session, enabled: Set<string>): void {
-  for (const [cat, re, valid, grp] of CATS) {
+  for (const [cat, re, valid, grp] of buildCats()) {
     if (!enabled.has(cat)) continue
     for (const m of text.matchAll(re)) {
       const val = m[grp] as string | undefined
@@ -327,11 +383,11 @@ function scannerLayer(text: string, sess: Session): string {
     const rep = join(dir, "rep.json")
     // ponytail: 同步 spawn 无超时；gitleaks 对小文本毫秒级返回，若遇大输入卡住再换 异步+Promise.race 超时
     // spawn 用 which 解析出的完整路径：裸名会让 Bun 每次做慢速 PATH 探测（实测 ~4s vs ~0.4s）
-    // timeout=10s：外部 gitleaks 偶发卡顿（首启/杀软/网络检查）时按 skip 处理，绝不阻塞掩码管线
+    // timeout=30s(可 SF_SCANNER_TIMEOUT 配置)：外部 gitleaks 偶发卡顿（首启/杀软/网络检查）时按 skip 处理，绝不阻塞掩码管线
     const r = Bun.spawnSync(
       [exe, "dir", dir, "--no-banner", "--exit-code", "0",
         "--report-path", rep, "--report-format", "json"],
-      { stdout: "pipe", stderr: "pipe", timeout: 10000 },
+      { stdout: "pipe", stderr: "pipe", timeout: (Number(process.env.SF_SCANNER_TIMEOUT) || 30) * 1000 },
     )
     if (r.exitCode === null) return "跳过(超时)"  // 超时被 kill，按未安装同语义处理
     let leaks: any[] = []
@@ -342,10 +398,16 @@ function scannerLayer(text: string, sess: Session): string {
     for (const leak of leaks) {
       const val = (leak.Secret || leak.secret || leak.Match || leak.match || "").toString().trim()
       if (val) {
-        const idx = text.indexOf(val)
-        if (idx >= 0 && sess.free(idx, idx + val.length)) {
-          sess.take(idx, idx + val.length, "secret", val)
-          taken++
+        // 遍历所有出现位置，取第一个未被 c_layer 占用的 span 掩码；
+        // 只定位首次出现会掩到早处、真值残留（indexOf 早处已被占则继续找下一个）
+        let pos = 0, idx: number
+        while ((idx = text.indexOf(val, pos)) >= 0) {
+          if (sess.free(idx, idx + val.length)) {
+            sess.take(idx, idx + val.length, "secret", val)
+            taken++
+            break
+          }
+          pos = idx + 1
         }
       }
     }

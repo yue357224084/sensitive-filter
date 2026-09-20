@@ -20,12 +20,12 @@ Run logs/config/code before pasting them into a cloud LLM (or your chat context)
 
 | 类别 Category | 规则 Rule |
 |---|---|
-| 密钥 Secrets | PEM 私钥、JWT、`sk-`/`sk_`/`pk-`（含 Stripe `sk_live_`）、GitHub `ghp_`/`github_pat_`、GitLab `glpat-`/`glrt-`/`gldt-`/`gloas-`/`glptt-`/`glcbt-`、Slack `xox`/`xapp-`、AWS `AKIA/ASIA/ABIA/ACCA`、Google `AIza`/`GOCSPX-`/`ya29.`、阿里云 `LTAI`、HuggingFace `hf_`、PyPI `pypi-`、age `AGE-SECRET-KEY-1`、Stripe `rk_`、Vault `hvs.`、New Relic `NRAK-`、Databricks `dapi`、Postman `PMAK-`、Linear `lin_api_`、RubyGems `rubygems_`、连接串（mongodb/postgres/mysql/redis/ssh 等）、任意协议 URL 内嵌凭据 `//user:pass@`（socks5 含）、Authorization 头（Bearer/Basic）、`password=`/`"password":`/`token:` 赋值行 |
+| 密钥 Secrets | PEM 私钥、JWT、`sk-`/`sk_`/`pk-`（含 Stripe `sk_live_`）、GitHub `ghp_`/`github_pat_`、GitLab `glpat-`/`glrt-`/`gldt-`/`gloas-`/`glptt-`/`glcbt-`、Slack `xox`/`xapp-`、AWS `AKIA/ASIA/ABIA/ACCA`、Google `AIza`/`GOCSPX-`/`ya29.`、阿里云 `LTAI`、HuggingFace `hf_`、PyPI `pypi-`、age `AGE-SECRET-KEY-1`、Stripe `rk_`、Vault `hvs.`、New Relic `NRAK-`、Databricks `dapi`、Postman `PMAK-`、Linear `lin_api_`、RubyGems `rubygems_`、连接串（mongodb/postgres/mysql/redis/ssh 等）、任意协议 URL 内嵌凭据 `//user:pass@`（socks5 含）、Authorization 头（Bearer/Basic）、`password=`/`"password":`/`token:` 赋值行、自定义字面值/键名（`SF_MASK_VALUES`/`SF_MASK_KEYS`） |
 | 身份证 ID card | 18 位 + GB11643 校验位验证 |
 | 手机号 Phone | 中国大陆手机号 |
 | 银行卡 Bank card | Luhn 校验位验证（误报极低） |
 | 邮箱 Email | 通用邮箱格式 |
-| IPv4 | 点分十进制，RFC 5737 保留段不豁免（按需 `--skip ipv4`） |
+| IPv4 | 点分十进制；内网段（10/8、172.16/12、192.168/16、127/8、169.254/16、100.64/10 CGNAT）默认豁免，`SF_MASK_PRIVATE_IP=1` 恢复掩码；RFC 5737 保留段不豁免 |
 
 输出可逆：脱敏为 `[SECRET_2]`/`[IDCARD_1]`/`[PHONE_1]`/`[BANKCARD_1]`/`[EMAIL_1]`/`[IPV4_1]` 形占位符，映射文件仅存本地，LLM 返回后 `--restore` 回填。映射文件名与内容 sha256 绑定，防错配；超过上限自动清理（默认保留 5000 个，从最旧删）。
 
@@ -122,6 +122,10 @@ SF_UPSTREAM=https://your-upstream/v1 node codex/proxy.mjs
 | `SF_SKIP=类别` | 跳过指定类别 | 无 |
 | `SF_MAP_DIR=目录` | 映射文件目录（CLI 用 `--map-out`） | 系统临时目录 |
 | `SF_MAP_KEEP=数量` | 映射保留上限（从最旧清理） | 5000 |
+| `SF_MASK_PRIVATE_IP=1` | 私网 IPv4（10/8、172.16/12、192.168/16、127/8、169.254/16、100.64/10 CGNAT）也掩码；不设 = 内网默认豁免 | 内网豁免 |
+| `SF_MASK_VALUES=值,...` | 自定义字面值脱敏（逗号分隔，≥4 字符，过短忽略并告警；命中归 SECRET 类、优先级最高） | 无 |
+| `SF_MASK_KEYS=键,...` | 自定义键名脱敏（逗号分隔；命中 `key=`/`key:` 赋值行掩值、键名保留；子串式匹配、大小写不敏感） | 无 |
+| `SF_SCANNER_TIMEOUT=秒` | 外部扫描器（betterleaks/gitleaks）单次执行超时 | 30 |
 | `SF_PROXY_PORT` | Codex 代理监听端口 | 3141 |
 | `SF_PROXY_HOST` | Codex 代理监听地址 | 仅本机 localhost（对外需显式设） |
 | `SF_UPSTREAM` | Codex 代理转发上游 | OpenAI 官方 |

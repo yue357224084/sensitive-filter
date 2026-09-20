@@ -5,11 +5,15 @@
 //  3) 键值规则误伤代码右值（值是更大表达式前缀 / 链式赋值）
 // 注意：所有占位符与样本运行时拼接，源码不写字面形态。
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { spawnSync } from "node:child_process"
 import { existsSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 import SensitiveFilterPlugin from "../opencode/plugins/sensitive-filter.ts"
 const { CATS, maskText, rehydrate, renumber, saveMap } = SensitiveFilterPlugin as any
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..")
 
 const T = (c: string, n: number) => "[" + c + "_" + n + "]"
 const TOK_IPV4 = new RegExp("\\[IPV4_\\d+\\]")
@@ -159,5 +163,101 @@ describe("regress: 无映射占位符告警", () => {
     }
     expect(logs.length).toBe(1)  // 旧实现无告警 → 必败
     expect(logs[0]).toContain(tok)
+  })
+})
+
+describe("SF_MASK_* 三功能（子进程隔离 env，py/mjs 行为一致）", () => {
+  // 子进程 env：剥离 SF_MASK_* 残留再按需注入，隔离确定性
+  const cleanEnv = (env: Record<string, string> = {}) => {
+    const e: Record<string, string> = { ...(process.env as any) }
+    delete e.SF_MASK_PRIVATE_IP
+    delete e.SF_MASK_VALUES
+    delete e.SF_MASK_KEYS
+    return { ...e, ...env }
+  }
+  const runCli = (cmd: string, args: string[], input: string, env: Record<string, string> = {}) => {
+    const r = spawnSync(cmd, args, { input, encoding: "utf8", timeout: 60000, env: cleanEnv(env) })
+    expect(r.status).toBe(0)
+    return r
+  }
+  const py = (input: string, env?: Record<string, string>) =>
+    runCli("python", [join(ROOT, "sensitive_filter.py"), "--no-gitleaks"], input, env)
+  const node = (input: string, env?: Record<string, string>) =>
+    runCli(process.execPath, [join(ROOT, "sensitive-filter.mjs"), "--no-gitleaks"], input, env)
+
+  test("私网 IPv4 默认豁免；SF_MASK_PRIVATE_IP=1 恢复掩码（RFC 5737 不豁免）", () => {
+    const priv = "192.168.1." + "1"
+    const pub = "192.0.2." + "99"
+    const input = "gw " + priv + " ext " + pub
+    // 默认：私网保留、公网(RFC5737)掩码，py/mjs 一致
+    for (const r of [py(input), node(input)]) {
+      expect(r.stdout).toContain(priv)
+      expect(r.stdout).not.toContain(pub)
+      expect(r.stdout).toMatch(/\[IPV4_\d+\]/)
+    }
+    // SF_MASK_PRIVATE_IP=1：私网也掩码，py/mjs 一致
+    for (const r of [py(input, { SF_MASK_PRIVATE_IP: "1" }), node(input, { SF_MASK_PRIVATE_IP: "1" })]) {
+      expect(r.stdout).not.toContain(priv)
+      expect(r.stdout).not.toContain(pub)
+    }
+  })
+
+  test("SF_MASK_VALUES 自定义字面值掩码（归 SECRET）；过短值忽略并告警", () => {
+    const lit = "77" + "77" + "77"
+    // 无配置：字面值原样保留
+    expect(py("v " + lit).stdout).toContain(lit)
+    expect(node("v " + lit).stdout).toContain(lit)
+    // 配置后：掩码为 SECRET，py/mjs 一致
+    for (const r of [py("v " + lit, { SF_MASK_VALUES: lit }), node("v " + lit, { SF_MASK_VALUES: lit })]) {
+      expect(r.stdout).not.toContain(lit)
+      expect(r.stdout).toMatch(/\[SECRET_\d+\]/)
+    }
+    // 过短值：忽略 + stderr 一次性告警
+    const rp = py("v ab", { SF_MASK_VALUES: "ab" })
+    expect(rp.stdout).toContain("v ab")
+    expect(rp.stderr).toContain("[警告] SF_MASK_VALUES 忽略过短(<4)值: ab")
+    const rn = node("v ab", { SF_MASK_VALUES: "ab" })
+    expect(rn.stdout).toContain("v ab")
+    expect(rn.stderr).toContain("[警告] SF_MASK_VALUES 忽略过短(<4)值: ab")
+  })
+
+  test("SF_MASK_KEYS 自定义键名：key= 赋值行掩值、键名保留", () => {
+    // 无配置：pss= 不被内置键规则命中，原样保留
+    expect(py("pss=abc123").stdout).toContain("pss=abc123")
+    expect(node("pss=abc123").stdout).toContain("pss=abc123")
+    // 配置 pss 后：值掩码、键保留，py/mjs 一致
+    for (const r of [py("pss=abc123", { SF_MASK_KEYS: "pss" }), node("pss=abc123", { SF_MASK_KEYS: "pss" })]) {
+      expect(r.stdout).toContain("pss=")
+      expect(r.stdout).not.toContain("abc123")
+      expect(r.stdout).toMatch(/pss=\[SECRET_\d+\]/)
+    }
+  })
+
+  test("ts 插件内联核心同样生效（env 每次调用读取，try/finally 恢复）", () => {
+    const keys = ["SF_MASK_PRIVATE_IP", "SF_MASK_VALUES", "SF_MASK_KEYS"]
+    const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]))
+    try {
+      for (const k of keys) delete process.env[k]
+      const priv = "192.168.1." + "1"
+      expect(maskText("gw " + priv, allCats(), false).out).toContain(priv)
+      process.env.SF_MASK_PRIVATE_IP = "1"
+      expect(maskText("gw " + priv, allCats(), false).out).not.toContain(priv)
+      delete process.env.SF_MASK_PRIVATE_IP
+      const lit = "77" + "77" + "77"
+      process.env.SF_MASK_VALUES = lit
+      const r3 = maskText("v " + lit, allCats(), false)
+      expect(r3.out).not.toContain(lit)
+      expect(r3.out).toMatch(/\[SECRET_\d+\]/)
+      delete process.env.SF_MASK_VALUES
+      process.env.SF_MASK_KEYS = "pss"
+      const r4 = maskText("pss=abc123", allCats(), false)
+      expect(r4.out).toContain("pss=")
+      expect(r4.out).not.toContain("abc123")
+    } finally {
+      for (const k of keys) {
+        if (saved[k] === undefined) delete process.env[k]
+        else process.env[k] = saved[k]
+      }
+    }
   })
 })
