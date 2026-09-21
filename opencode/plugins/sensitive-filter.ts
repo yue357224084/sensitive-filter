@@ -4,6 +4,8 @@
 //        + experimental.chat.system.transform（系统提示词 + 占位符指令注入）
 // 还原侧：tool.execute.before（模型回显占位符→工具执行前还原真值）
 //        + experimental.text.complete（LLM 回复展示前还原）
+//        + event/session.updated（summarize 生成的会话 title 入库前无还原钩子，
+//          展示层监听该事件把 title 里的占位符还原后回写）
 // 映射落盘：os.tmpdir()/sensitive_filter_map_<sha8>.json（默认；SF_MAP_DIR 可改目录。按容量清理，保留最新
 //   SF_MAP_KEEP 个（默认 5000）；
 //   与 sensitive_filter.py / sensitive-filter.mjs 的 --restore 双向互操作）
@@ -58,7 +60,7 @@ const TOKEN_HAS = /\[(?:SECRET|IDCARD|PHONE|BANKCARD|EMAIL|IPV4)_\d+\]/
 const TOKEN_ANY = /\[(?:SECRET|IDCARD|PHONE|BANKCARD|EMAIL|IPV4)_\d+\]/g
 
 const SF_INSTRUCTION =
-  "[sensitive-filter] 对话里的 [SECRET_n]/[IDCARD_n]/[PHONE_n]/[BANKCARD_n]/[EMAIL_n]/[IPV4_n] 是真实值的本地脱敏占位符：请原样保留引用、不要改写格式、不要编造原值；在 bash/写文件等工具参数里引用时也保持原样（工具执行前会自动还原为真值）。"
+  "[sensitive-filter] 对话里的 [SECRET_n]/[IDCARD_n]/[PHONE_n]/[BANKCARD_n]/[EMAIL_n]/[IPV4_n] 是真实值的本地脱敏占位符：请原样保留引用、不要改写格式、不要编造原值；在 bash/写文件等工具参数里引用时也保持原样（工具执行前会自动还原为真值）。给文件/目录命名时不要引用占位符或其编号（如 ipv4_41），用语义字段（如 zid、日期）命名。"
 
 // opencode 插件加载约束：模块顶层每个导出值必须是函数（getLegacyPlugins 遍历 Object.values(mod)，
 // 数组/对象导出直接抛 "Plugin export is not a function"，具名函数导出会被误当插件实例调用）。
@@ -581,6 +583,22 @@ const SensitiveFilterPlugin: Plugin = async ({ client }) => {
     },
     "experimental.text.complete": async (_input, output) => {
       if (typeof output.text === "string") output.text = rehydrate(output.text)
+    },
+    event: async ({ event }) => {
+      // summarize 生成的 title 基于脱敏上下文，占位符字面量会原样入库并在 UI 展示；
+      // title 不经过 tool.execute.before / text.complete —— 在此还原后回写。
+      // 幂等：还原无变化（映射缺失）或已无占位符时不回写，session.update 触发的
+      // 再次 session.updated 会因 title 无占位符直接返回，不会成环。
+      if (event.type !== "session.updated") return
+      const info = event.properties.info
+      if (typeof info?.title !== "string" || !TOKEN_HAS.test(info.title)) return
+      const fixed = rehydrate(info.title)
+      if (fixed === info.title) return
+      try {
+        await client.session.update({ path: { id: info.id }, body: { title: fixed } })
+      } catch (e) {
+        console.error(`[sensitive-filter] 会话 title 还原回写失败: ${e}`)
+      }
     },
   }
 }
