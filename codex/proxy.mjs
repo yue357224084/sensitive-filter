@@ -46,7 +46,7 @@ if (process.env.SF_OFF === "1") {
 
 const MAP_PREFIX = "sensitive_filter_map_"
 const SF_INSTRUCTION =
-  "[sensitive-filter] 对话里的 [SECRET_n]/[IDCARD_n]/[PHONE_n]/[BANKCARD_n]/[EMAIL_n]/[IPV4_n] 是真实值的本地脱敏占位符：请原样保留引用、不要改写格式、不要编造原值；在 bash/写文件等工具参数里引用时也保持原样（工具执行前会自动还原为真值）。"
+  "[sensitive-filter] 对话里的 [SECRET_n]/[IDCARD_n]/[PHONE_n]/[BANKCARD_n]/[EMAIL_n]/[IPV4_n] 是真实值的本地脱敏占位符：请原样保留引用、不要改写格式、不要编造原值；在 bash/写文件等工具参数里引用时也保持原样（工具执行前会自动还原为真值）。占位符编号只是本地掩码序号，与真实值没有任何数值关系（编号 n 并非对应真实 IP 的末段，也不代表任何真实数据的一部分）：严禁剥掉占位符只保留编号、或把编号拼进主机名/标识符（如把 app-[IPV4_n] 写成 app-123）——这类写法无法还原，会把错误值展示给用户。需要可读的主机/对象标识时，保留完整占位符（如 app-[IPV4_n]），展示层会自动还原为真实值。"
 
 const DEBUG = process.env.SF_PROXY_DEBUG === "1" || process.argv.includes("--debug")
 

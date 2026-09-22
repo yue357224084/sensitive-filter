@@ -60,7 +60,7 @@ const TOKEN_HAS = /\[(?:SECRET|IDCARD|PHONE|BANKCARD|EMAIL|IPV4)_\d+\]/
 const TOKEN_ANY = /\[(?:SECRET|IDCARD|PHONE|BANKCARD|EMAIL|IPV4)_\d+\]/g
 
 const SF_INSTRUCTION =
-  "[sensitive-filter] 对话里的 [SECRET_n]/[IDCARD_n]/[PHONE_n]/[BANKCARD_n]/[EMAIL_n]/[IPV4_n] 是真实值的本地脱敏占位符：请原样保留引用、不要改写格式、不要编造原值；在 bash/写文件等工具参数里引用时也保持原样（工具执行前会自动还原为真值）。给文件/目录命名时不要引用占位符或其编号（如 ipv4_41），用语义字段（如 zid、日期）命名。"
+  "[sensitive-filter] 对话里的 [SECRET_n]/[IDCARD_n]/[PHONE_n]/[BANKCARD_n]/[EMAIL_n]/[IPV4_n] 是真实值的本地脱敏占位符：请原样保留引用、不要改写格式、不要编造原值；在 bash/写文件等工具参数里引用时也保持原样（工具执行前会自动还原为真值）。占位符编号只是本地掩码序号，与真实值没有任何数值关系（编号 n 并非对应真实 IP 的末段，也不代表任何真实数据的一部分）：严禁剥掉占位符只保留编号、或把编号拼进主机名/标识符（如把 app-[IPV4_n] 写成 app-123）——这类写法无法还原，会把错误值展示给用户。需要可读的主机/对象标识时，保留完整占位符（如 app-[IPV4_n]），展示层会自动还原为真实值。给文件/目录命名时不要引用占位符或其编号（如 ipv4_41），用语义字段（如 zid、日期）命名。"
 
 // opencode 插件加载约束：模块顶层每个导出值必须是函数（getLegacyPlugins 遍历 Object.values(mod)，
 // 数组/对象导出直接抛 "Plugin export is not a function"，具名函数导出会被误当插件实例调用）。
