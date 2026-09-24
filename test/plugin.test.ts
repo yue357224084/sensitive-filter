@@ -388,7 +388,7 @@ describe("钩子级 e2e（掩码→还原闭环 / fail-closed）", () => {
 
   test("初始化并写入钩子测试映射", async () => {
     writeMap(hookMap, [[ipTokFull, fakeIp], [secTok, fakeSec]])
-    plugin = await SensitiveFilterPlugin({ client: fakeClient } as any)
+    plugin = await (SensitiveFilterPlugin as any).server({ client: fakeClient } as any)
     expect(typeof plugin["experimental.chat.messages.transform"]).toBe("function")
   })
 

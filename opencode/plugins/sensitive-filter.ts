@@ -64,7 +64,7 @@ const SF_INSTRUCTION =
 
 // opencode 插件加载约束：模块顶层每个导出值必须是函数（getLegacyPlugins 遍历 Object.values(mod)，
 // 数组/对象导出直接抛 "Plugin export is not a function"，具名函数导出会被误当插件实例调用）。
-// 因此本文件只保留 export default；内部实现经 Object.assign 挂在插件函数上供 bun test 访问。
+// 因此本文件只保留 export default；内部实现经 Object.assign 挂在 default 对象上供 bun test 访问。
 
 function makeSep(): string {
   // 仅字母+连字符，不含数字，保证不命中任何过滤正则；每次调用随机防内容碰撞
@@ -376,7 +376,10 @@ function cLayer(text: string, sess: Session, enabled: Set<string>): void {
 // ---- 外部扫描器增强层：betterleaks 优先、回退 gitleaks；Bun.which 检测，未安装自动跳过 ----
 
 function scannerLayer(text: string, sess: Session): string {
-  const exe = Bun.which("betterleaks") || Bun.which("gitleaks")
+  const B: any = (globalThis as any).Bun
+  const which = B?.which?.bind(B)
+  if (!which) return "未安装(可选: betterleaks 或 gitleaks)"
+  const exe = (which("betterleaks") || which("gitleaks")) as string | null
   if (!exe) return "未安装(可选: betterleaks 或 gitleaks)"
   const scanner = /betterleaks/i.test(exe) ? "betterleaks" : "gitleaks"
   const dir = mkdtempSync(join(tmpdir(), "sfilter_gl_"))
@@ -386,7 +389,9 @@ function scannerLayer(text: string, sess: Session): string {
     // ponytail: 同步 spawn 无超时；gitleaks 对小文本毫秒级返回，若遇大输入卡住再换 异步+Promise.race 超时
     // spawn 用 which 解析出的完整路径：裸名会让 Bun 每次做慢速 PATH 探测（实测 ~4s vs ~0.4s）
     // timeout=30s(可 SF_SCANNER_TIMEOUT 配置)：外部 gitleaks 偶发卡顿（首启/杀软/网络检查）时按 skip 处理，绝不阻塞掩码管线
-    const r = Bun.spawnSync(
+    const B2: any = (globalThis as any).Bun
+    if (!B2?.spawnSync) return "跳过(无Bun.spawnSync)"
+    const r = B2.spawnSync(
       [exe, "dir", dir, "--no-banner", "--exit-code", "0",
         "--report-path", rep, "--report-format", "json"],
       { stdout: "pipe", stderr: "pipe", timeout: (Number(process.env.SF_SCANNER_TIMEOUT) || 30) * 1000 },
@@ -603,18 +608,310 @@ const SensitiveFilterPlugin: Plugin = async ({ client }) => {
   }
 }
 
-export default SensitiveFilterPlugin
+// 测试接口与内部实现的暴露统一放在下面的 default 对象上（Object.assign），
+// 函数本身不再挂属性（V1 只调 server() 取返回值，不读函数属性）。
 
-// 测试接口：挂函数属性不影响 opencode 的模块级导出校验（Object.values(mod) 只见 default 一个函数）
-Object.assign(SensitiveFilterPlugin, {
-  CATS,
-  collectPartSlots,
-  tokenLookup,
-  rehydrate,
-  deepRehydrate,
-  maskText,
-  saveMap,
-  maskBatch,
-  makeSep,
-  renumber,
-})
+// ================================================================
+// V2 适配（opencode v2 新插件 API；V1 走 server() 原逻辑，互不干扰）
+// 映射（官方迁移表）：
+//   experimental.chat.messages/system.transform → ctx.session.hook("context"/"compaction"/"generate"/"title")，改 event.system/event.messages
+//   tool.execute.before → ctx.tool.hook("execute.before")
+//   experimental.text.complete（无直接对应）→ ctx.session.hook("http.response")，SSE/JSON 原文替换还原
+//   event session.renamed → ctx.event.subscribe + ctx.session.update 回写 title（rename 仅作兜底，2.0.x 无此方法）
+// 说明：V2 Message 用 content 数组（V1 用 parts），system 用 {type:"text",text} 对象（V1 用 string）；
+//   以下收集器两种形状都处理。核心掩码复用同一 maskBatch（拼装-掩码-拆回 + saveMap + fail-closed）。
+// ================================================================
+
+function collectV2PartSlot(p: any, slots: Slot[]): void {
+  if (!p || typeof p !== "object") return
+  const t = (p as any).type
+  // V1 + V2 文本类：text / reasoning（reasoning 只动 text，encrypted 不动）
+  if ((t === "text" || t === "reasoning") && typeof (p as any).text === "string") {
+    slots.push({ get: () => p.text, set: (v) => { p.text = v } })
+    return
+  }
+  // V2 compaction：text（encrypted 不动；null 跳过）
+  if (t === "compaction" && typeof (p as any).text === "string") {
+    slots.push({ get: () => p.text, set: (v) => { p.text = v } })
+    return
+  }
+  // V1 subtask prompt
+  if (t === "subtask" && typeof (p as any).prompt === "string") {
+    slots.push({ get: () => p.prompt, set: (v) => { p.prompt = v } })
+    return
+  }
+  // V1 tool state（output/error/raw/input JSON；fail-closed 语义复用）
+  if (t === "tool" && (p as any).state && typeof (p as any).state === "object") {
+    collectPartSlots(p, slots)
+    return
+  }
+  // V2 tool-call：input 未知 JSON（string 直接槽；对象 JSON 槽，解析失败则 sf_masked 占位 fail-closed）
+  if (t === "tool-call" && "input" in p) {
+    if (typeof (p as any).input === "string") {
+      slots.push({ get: () => p.input, set: (v) => { p.input = v } })
+    } else if ((p as any).input && typeof (p as any).input === "object") {
+      slots.push({
+        get: () => JSON.stringify((p as any).input),
+        set: (v) => {
+          try {
+            const o = JSON.parse(v)
+            if (o && typeof o === "object") (p as any).input = o
+            else (p as any).input = { sf_masked: true }
+          } catch {
+            (p as any).input = { sf_masked: true }
+          }
+        },
+      })
+    }
+    return
+  }
+  // V2 tool-result：result.value（string 直接槽；content 数组逐条文本；对象 JSON 槽）
+  if (t === "tool-result" && (p as any).result && typeof (p as any).result === "object") {
+    const r: any = (p as any).result
+    if (typeof r.value === "string") {
+      slots.push({ get: () => r.value, set: (v) => { r.value = v } })
+    } else if (Array.isArray(r.value)) {
+      for (const item of r.value) {
+        if (item && typeof item === "object" && typeof (item as any).text === "string") {
+          slots.push({ get: () => (item as any).text, set: (v) => { (item as any).text = v } })
+        }
+      }
+    } else if (r.value && typeof r.value === "object") {
+      slots.push({
+        get: () => JSON.stringify(r.value),
+        set: (v) => {
+          try { r.value = JSON.parse(v) } catch { r.value = { sf_masked: true } }
+        },
+      })
+    }
+    return
+  }
+  // 兜底：带 text 字符串字段的未知 part（media/file 含 url/uri 的不动，避免误改引用）
+  if (typeof (p as any).text === "string" && t !== "media" && t !== "file") {
+    slots.push({ get: () => p.text, set: (v) => { p.text = v } })
+  }
+}
+
+function collectV2ContextSlots(event: any, slots: Slot[]): void {
+  const sys = (event as any)?.system
+  if (Array.isArray(sys)) {
+    sys.forEach((s: any, i: number) => {
+      if (typeof s === "string") {
+        slots.push({ get: () => sys[i], set: (v) => { sys[i] = v } })
+      } else if (s && typeof s === "object" && typeof s.text === "string") {
+        slots.push({ get: () => s.text, set: (v) => { s.text = v } })
+      }
+    })
+  }
+  const msgs = (event as any)?.messages
+  if (Array.isArray(msgs)) {
+    for (const m of msgs) {
+      if (!m || typeof m !== "object") continue
+      if (Array.isArray((m as any).parts)) {
+        for (const p of (m as any).parts) collectV2PartSlot(p, slots)
+        continue
+      }
+      if (Array.isArray((m as any).content)) {
+        for (const p of (m as any).content) collectV2PartSlot(p, slots)
+        continue
+      }
+      if (typeof (m as any).content === "string") {
+        const mm: any = m
+        slots.push({ get: () => mm.content, set: (v) => { mm.content = v } })
+      } else if (typeof (m as any).text === "string") {
+        const mm: any = m
+        slots.push({ get: () => mm.text, set: (v) => { mm.text = v } })
+      }
+    }
+  }
+}
+
+function maskV2Event(event: any): void {
+  const slots: Slot[] = []
+  collectV2ContextSlots(event, slots)
+  maskBatch(slots)
+  // 占位符指令注入（对齐 V1 system.transform 尾部 push；V2 system 为对象数组时推对象）
+  try {
+    const sys = (event as any)?.system
+    if (Array.isArray(sys)) {
+      if (sys.some((s: any) => typeof s === "string")) (sys as any[]).push(SF_INSTRUCTION)
+      else (sys as any[]).push({ type: "text", text: SF_INSTRUCTION })
+    }
+  } catch { /* 指令注入失败不阻断掩码主路径 */ }
+}
+
+// V2 工具参数还原。
+// 注意：V2 事件里的 input 常是 Effect 的只读(immutable)结构，就地改写会抛
+// "Attempted to assign to readonly property"。策略：
+//   1) 无占位符直接跳过（绝大多数工具零开销、零副作用）
+//   2) 先试就地还原；只读则整体替换为「还原后的深拷贝」
+//   3) 仍失败只告警不抛出——还原失败只会让工具拿到占位符（过度脱敏，不泄密），
+//      若在此抛出会把全部工具调用阻断，代价远大于收益
+function isPlainObject(v: any): boolean {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return false
+  const c = (v as any).constructor
+  return c === Object || c === undefined
+}
+
+function hasToken(v: any, depth = 0): boolean {
+  if (v == null || depth > 8) return false
+  if (typeof v === "string") return TOKEN_HAS.test(v)
+  if (Array.isArray(v)) return v.some((x) => hasToken(x, depth + 1))
+  if (isPlainObject(v)) return Object.keys(v).some((k) => hasToken(v[k], depth + 1))
+  return false
+}
+
+function deepRehydrateClone(v: any): any {
+  if (typeof v === "string") return rehydrate(v)
+  if (Array.isArray(v)) return v.map((x) => deepRehydrateClone(x))
+  if (isPlainObject(v)) {
+    const o: Record<string, any> = {}
+    for (const k of Object.keys(v)) o[k] = deepRehydrateClone(v[k])
+    return o
+  }
+  return v // 非普通对象（类实例/Date 等）原样返回，避免破坏结构
+}
+
+async function rehydrateToolEventV2(event: any): Promise<void> {
+  try {
+    if (!event || typeof event !== "object") return
+    // get/set 成对，避免 targets 与 current 下标错位（input 缺失时 args 会被跳过）
+    const slots: Array<{ get: () => any; set: (v: any) => void }> = []
+    if (event.input !== undefined) slots.push({ get: () => event.input, set: (v) => { event.input = v } })
+    // 以下两个是 V1 时代/防御性字段；V2(2.0.x) 的工具钩子只给 event.input
+    if (event.args !== undefined) slots.push({ get: () => event.args, set: (v) => { event.args = v } })
+    if (event.output && typeof event.output === "object" && (event.output as any).args !== undefined) {
+      slots.push({ get: () => (event.output as any).args, set: (v) => { (event.output as any).args = v } })
+    }
+    for (const slot of slots) {
+      const val = slot.get()
+      if (val === undefined || !hasToken(val)) continue
+      try {
+        deepRehydrate(val) // 就地（V1 同语义；V2 若可变则最省事）
+      } catch {
+        try {
+          slot.set(deepRehydrateClone(val)) // 只读：整体替换为还原副本
+        } catch (e2) {
+          console.error(`[sensitive-filter] 工具参数还原跳过（结构只读）: ${e2}`)
+        }
+      }
+    }
+  } catch (e) {
+    console.error(`[sensitive-filter] 工具参数还原跳过: ${e}`)
+  }
+}
+
+async function rehydrateHttpResponseV2(event: any): Promise<void> {
+  try {
+    const res = event?.response
+    if (!res) return
+    let ct = ""
+    try { ct = res.headers?.get?.("content-type") ?? "" } catch { ct = "" }
+    if (/^(image|audio|video)\//i.test(ct) || /octet-stream/i.test(ct)) return
+    // 流式(SSE)：整段缓冲会破坏逐 token 输出，且逐 chunk 文本改写对含换行/引号的真值不安全。
+    // 这里直接放行，保持流式 UX 不变（代价：流式回复里占位符保持原样，必要时用 CLI --restore 还原）。
+    if (/text\/event-stream/i.test(ct)) return
+    let txt = ""
+    try { txt = await res.clone().text() } catch { return }
+    if (!txt || !TOKEN_HAS.test(txt)) return
+    const fixed = rehydrate(txt)
+    if (fixed === txt) return
+    // 还原后 body 长度变了：必须剔除 content-length，否则客户端按旧长度截断/挂起。
+    // res.text() 返回的是已解码文本，若原响应带 content-encoding(gzip/br) 还留着该头，
+    // 客户端会对明文再做一次 gunzip → 直接损坏。transfer-encoding 同理不能带。
+    const h = new Headers(res.headers)
+    h.delete("content-length")
+    h.delete("content-encoding")
+    h.delete("transfer-encoding")
+    event.response = new Response(fixed, { status: res.status, statusText: res.statusText, headers: h })
+  } catch (e) {
+    console.error(`[sensitive-filter] http.response 还原跳过: ${e}`)
+  }
+}
+
+// V2 会话标题还原。
+// v2.15 原生事件是 `session.renamed`，体为平铺 `data:{ sessionID, title }`（无 properties/info 包装）；
+// `session.updated` + `properties.info` 是 SessionV1 兼容层的形态，V2 不触发——两条都接，兜底无害。
+// 回写用 ctx.session.update({ sessionID, title })（v2.15 校验过该方法存在，内部转 rename）。
+function setupTitleWatcherV2(ctx: any, controller: AbortController): void {
+  const restoreTitle = async (rawTitle: unknown, rawSessionID: unknown) => {
+    if (typeof rawTitle !== "string" || !TOKEN_HAS.test(rawTitle)) return
+    const fixed = rehydrate(rawTitle)
+    // 空标题会被服务端当作"重新生成标题"（session.update 处理器里 title 为空即 generate），必须挡
+    if (!fixed || fixed === rawTitle) return
+    if (!rawSessionID) return
+    const sessionID = rawSessionID
+    const attempts = [
+      () => ctx.session.update({ sessionID, title: fixed }),  // 2.0.x 插件上下文（已核实存在）
+      () => ctx.session.rename({ sessionID, title: fixed }),  // 较新 V2 文档的命名
+    ]
+    for (const call of attempts) {
+      try { await call(); return } catch { /* 试下一种形态 */ }
+    }
+    console.error("[sensitive-filter] 会话 title 还原回写失败：update/rename 均不可用")
+  }
+
+  void (async () => {
+    try {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        try {
+          const type = (event as any)?.type
+          if (type === "session.renamed") {
+            const d = (event as any)?.data
+            await restoreTitle(d?.title, d?.sessionID ?? (event as any)?.sessionID)
+          } else if (type === "session.updated") {
+            const info = (event as any)?.properties?.info ?? (event as any)?.info
+            await restoreTitle(info?.title, info?.id ?? info?.sessionID ?? (event as any)?.sessionID)
+          }
+        } catch { /* 单事件异常不中断订阅 */ }
+      }
+    } catch { /* abort/断开时退出 */ }
+  })()
+}
+
+async function setupV2(ctx: any): Promise<() => void> {
+  if (process.env.SF_OFF === "1") return () => {}
+  const mask = (event: any) => {
+    try {
+      maskV2Event(event)
+    } catch (e) {
+      throw new Error(`[sensitive-filter] 掩码失败，已阻断发送(fail-closed): ${e}`)
+    }
+  }
+  await ctx.session.hook("context", mask)
+  try { await ctx.session.hook("compaction", mask) } catch { /* 旧 V2 无该 kind 则跳过 */ }
+  try { await ctx.session.hook("generate", mask) } catch { /* 同上 */ }
+  try { await ctx.session.hook("title", mask) } catch { /* 同上 */ }
+  await ctx.tool.hook("execute.before", rehydrateToolEventV2)
+  try {
+    await ctx.session.hook("http.response", rehydrateHttpResponseV2)
+  } catch (e) {
+    console.error(`[sensitive-filter] http.response 钩子注册失败（回复占位符将保留原文）: ${e}`)
+  }
+  const controller = new AbortController()
+  try { setupTitleWatcherV2(ctx, controller) } catch { /* 订阅失败不阻断主路径 */ }
+  return () => { try { controller.abort() } catch { /* ignore */ } }
+}
+
+// 兼容导出：V1(>=1.18.29) 调 server() 走顶部 SensitiveFilterPlugin 原逻辑；V2 读 id/setup()。
+// 不静态 import "@opencode/plugin"：V1 机器没装该包，静态 import 会导致 V1 加载失败；纯对象运行时零依赖。
+// 测试接口（CATS/maskText/...）一并挂到 default 对象上，保持既有 bun test 的 default 解构可用。
+export default Object.assign(
+  {
+    id: "sensitive-filter",
+    setup: setupV2,
+    server: SensitiveFilterPlugin,
+  },
+  {
+    CATS,
+    collectPartSlots,
+    tokenLookup,
+    rehydrate,
+    deepRehydrate,
+    maskText,
+    saveMap,
+    maskBatch,
+    makeSep,
+    renumber,
+  },
+)

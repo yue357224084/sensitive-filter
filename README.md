@@ -94,6 +94,10 @@ cp opencode/plugins/sensitive-filter.ts .opencode/plugins/
 
 > 注意：会话标题生成调用不过插件（opencode issue #46115），首条消息可能明文到达标题模型；如需规避设 `"agent": { "title": { "disable": true } }`。
 
+**V1 / V2 兼容（双入口）**：插件 default 导出为 `{ id, setup, server }`。OpenCode V1(>=1.18.29) 走 `server()`（原钩子逻辑不变），V2 走 `setup()` 用新 API 注册等价钩子。V2 映射：`messages/system.transform` → `session.hook("context")`（同时注册 `compaction`/`generate`/`title`）、`tool.execute.before` → `tool.hook("execute.before")`、`event` → `event.subscribe()`；V1 的 `experimental.text.complete` 在 V2 无对应钩子，改用 `session.hook("http.response")` 整段还原——**流式(`text/event-stream`)响应直接放行不还原**（整段缓冲会破坏逐 token 输出，逐 chunk 文本改写对含换行/引号的真值不安全），因此流式回复里的占位符会原样显示，需要时用 CLI `--restore` 兜底。
+
+**V2 部署位置**：V2 自动发现 `plugin/` 与 `plugins/` 目录下的插件入口文件；不含入口文件的子目录不会被加载（把插件放在顶层，别塞进子目录），且 V2 不读 V1 的 `tui.json`。插件需放在该目录或写入 `opencode.json` 的 `plugins` 数组。
+
 ### Codex CLI 代理
 
 Codex 无原生请求改写钩子，通过本地反向代理接入：
