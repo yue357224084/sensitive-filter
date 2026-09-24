@@ -94,7 +94,11 @@ cp opencode/plugins/sensitive-filter.ts .opencode/plugins/
 
 > 注意：会话标题生成调用不过插件（opencode issue #46115），首条消息可能明文到达标题模型；如需规避设 `"agent": { "title": { "disable": true } }`。
 
-**V1 / V2 兼容（双入口）**：插件 default 导出为 `{ id, setup, server }`。OpenCode V1(>=1.18.29) 走 `server()`（原钩子逻辑不变），V2 走 `setup()` 用新 API 注册等价钩子。V2 映射：`messages/system.transform` → `session.hook("context")`（同时注册 `compaction`/`generate`/`title`）、`tool.execute.before` → `tool.hook("execute.before")`、`event` → `event.subscribe()`；V1 的 `experimental.text.complete` 在 V2 无对应钩子，改用 `session.hook("http.response")` 整段还原——**流式(`text/event-stream`)响应直接放行不还原**（整段缓冲会破坏逐 token 输出，逐 chunk 文本改写对含换行/引号的真值不安全），因此流式回复里的占位符会原样显示，需要时用 CLI `--restore` 兜底。
+**V1 / V2 兼容（双入口）**：插件 default 导出为 `{ id, setup, server }`。OpenCode V1(>=1.18.29) 走 `server()`（原钩子逻辑不变），V2 走 `setup()` 用新 API 注册等价钩子。V2 映射：`messages/system.transform` → `session.hook("context")`（同时注册 `compaction`/`generate`/`title`）、`tool.execute.before` → `tool.hook("execute.before")`、`event` → `event.subscribe()`；V1 的 `experimental.text.complete` 在 V2 无对应钩子，改用 `session.hook("http.response")` 还原。
+
+**V2 流式(SSE)还原**：按 SSE 帧解析 → `JSON.parse` → 逐字符串字段替换 → `JSON.stringify` 回写（转义交给 JSON 序列化，故真值含换行/引号/反斜杠也安全）。占位符在流式下几乎必然被切成多个 delta（一个占位符是多个 token），跨帧撕裂用「扣帧」处理：某帧字段值以「疑似未完成的占位符前缀」结尾时该帧暂不发出，等下一帧同路径续上后拼接还原，流结束时连同半截文本原样冲出（不丢字节）。正常回复里只有极少数帧会被扣（延迟约一个 delta），其余立即透传；**不含 `[` 的帧逐字节透传**（含 `[` 的帧会经 JSON 重序列化：语义等价、字节可能变化）。帧边界 LF / CRLF 都认（网关可能规范化换行）。整体不向外抛异常（单帧异常原样透传，绝不污染回复；上游中断时已缓冲内容照常冲出），缓冲有上限，可用 `SF_SSE_REHYDRATE=0` 整段放行。
+
+> V2 下仍无法还原的情况：WebSocket 型 provider 不走 `http.response`（需 `experimental.ws.receive`，暂未接入）；`tool_call.arguments` / Anthropic `input_json_delta.partial_json` 这类「JSON 内嵌 JSON」的字段只做单层替换，多层转义的真值可能不精确（工具参数另有 `tool.execute.before` 兜底还原）。
 
 **V2 部署位置**：V2 自动发现 `plugin/` 与 `plugins/` 目录下的插件入口文件；不含入口文件的子目录不会被加载（把插件放在顶层，别塞进子目录），且 V2 不读 V1 的 `tui.json`。插件需放在该目录或写入 `opencode.json` 的 `plugins` 数组。
 

@@ -801,6 +801,249 @@ async function rehydrateToolEventV2(event: any): Promise<void> {
   }
 }
 
+// ================================================================
+// V2 流式(SSE)还原
+//
+// 为什么不能「整段缓冲」：会破坏逐 token 输出。
+// 为什么不能在原文上做字符串替换：① 真值可能含换行/引号/反斜杠，插进 JSON 字符串会破坏转义；
+//   ② 流式下占位符几乎必然被切成多个 delta（一个占位符是多个 token），两半在原文里被 JSON
+//   帧框隔开（形如 …"[SEC"}}] 换行 data: {…"RET_1]"…），正则永远匹配不上。
+//
+// 做法：按 SSE 帧解析 → JSON.parse → 逐字符串字段替换 → JSON.stringify 回写（转义交给序列化）。
+//   跨帧撕裂用「扣帧」处理：某帧字段值以「疑似未完成的占位符前缀」结尾时，该帧暂不发出，
+//   等下一帧同路径续上后拼接还原；仍不完整则继续扣。流结束时被扣帧连同半截文本原样冲出（不丢字节）。
+//   正常回复里只有极少数帧会被扣（延迟约一个 delta），其余立即透传。
+// ================================================================
+
+// 占位符前缀：左方括号 + 大写字母/数字/下划线（占位符全为大写，形如「类别_序号」）
+// 需宽松到能匹配「分类名被切开」的前缀（如 [IP、[SEC），否则跨帧撕裂识别不出来；
+// SSE_MAX_TAIL 保证不会长期扣住普通文本（超过即释放）。
+const SSE_PARTIAL = /\[[A-Z0-9_]{0,32}$/
+const SSE_MAX_TAIL = 32            // 半截占位符的最大长度（超过就不可能是占位符前缀，立即释放）
+const SSE_MAX_BUF = 4 * 1024 * 1024 // 单流缓冲上限，超限直接透传（防无界增长）
+
+// 值尾部是"疑似未完成的占位符前缀"时返回其长度（扣留多少），否则 0
+function ssePartialLen(s: string): number {
+  const li = s.lastIndexOf("[")
+  if (li < 0 || s.length - li > SSE_MAX_TAIL) return 0
+  if (s.indexOf("]", li) >= 0) return 0
+  return SSE_PARTIAL.test(s.slice(li)) ? s.length - li : 0
+}
+
+function walkStrings(node: any, cb: (v: string, path: string[]) => string, path: string[] = []): void {
+  if (Array.isArray(node)) {
+    for (let i = 0; i < node.length; i++) {
+      const v = node[i]
+      if (typeof v === "string") node[i] = cb(v, [...path, String(i)])
+      else if (v && typeof v === "object") walkStrings(v, cb, [...path, String(i)])
+    }
+    return
+  }
+  if (node && typeof node === "object") {
+    for (const k of Object.keys(node)) {
+      const v = node[k]
+      if (typeof v === "string") node[k] = cb(v, [...path, k])
+      else if (v && typeof v === "object") walkStrings(v, cb, [...path, k])
+    }
+  }
+}
+
+function getAtPath(obj: any, path: string[]): any {
+  let cur = obj
+  for (const k of path) { if (cur == null) return undefined; cur = cur[k] }
+  return cur
+}
+
+function setAtPath(obj: any, path: string[], val: string): void {
+  let cur = obj
+  for (let i = 0; i < path.length - 1; i++) {
+    if (cur == null) return
+    cur = cur[path[i]]
+  }
+  if (cur != null && typeof cur === "object") cur[path[path.length - 1]] = val
+}
+
+// 单 data 行的 JSON 帧才处理；结束哨兵/多 data 行/非 JSON → 原样透传
+// 行尾先统一去掉 \r（JSON 字符串里的裸 CR 非法，只能是行结束符），重建时统一用 \n
+function sseParseFrame(frame: string): { obj: any; lines: string[]; lineIndex: number } | null {
+  const lines = frame.replace(/\r/g, "").split("\n")
+  let lineIndex = -1
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].startsWith("data:")) continue
+    if (lineIndex >= 0) return null // 多 data 行（少见）不处理，保证不破坏语义
+    lineIndex = i
+  }
+  if (lineIndex < 0) return null
+  const payload = lines[lineIndex].slice(5).trim()
+  if (!payload || payload === "[DONE]") return null
+  let obj: any
+  try { obj = JSON.parse(payload) } catch { return null }
+  if (!obj || typeof obj !== "object") return null
+  return { obj, lines, lineIndex }
+}
+
+function sseBuildFrame(lines: string[], lineIndex: number, obj: any): string {
+  const out = lines.slice()
+  out[lineIndex] = "data: " + JSON.stringify(obj)
+  return out.join("\n")
+}
+
+type SseHeld = { obj: any; lines: string[]; lineIndex: number; path: string[]; head: string; partial: string }
+
+// 流式还原器（纯字符串进出，便于单测；不依赖流 API）
+class SseRehydrator {
+  private pending = ""
+  private held: SseHeld | null = null
+  rewrites = 0
+
+  // 推入一段已解码文本，返回"现在可以安全发出去"的文本
+  push(chunk: string): string {
+    this.pending += chunk
+    if (this.pending.length > SSE_MAX_BUF) {
+      const all = this.pending
+      this.pending = ""
+      return this.release() + all // 超限：已扣帧吐出 + 其余原样透传
+    }
+    let out = ""
+    // 帧边界兼容 LF 与 CRLF：反向代理/网关可能把换行规范成 \r\n，只认 "\n\n" 会导致
+    // 一帧都切不出来（整段缓冲到流结束才吐 + 完全不还原）
+    for (;;) {
+      const m = /\r?\n\r?\n/.exec(this.pending)
+      if (!m) break
+      const end = m.index + m[0].length
+      const frame = this.pending.slice(0, end)
+      this.pending = this.pending.slice(end)
+      out += this.onFrame(frame)
+    }
+    return out
+  }
+
+  // 流结束：被扣帧与残帧一并冲出，保证不丢字节
+  flush(): string {
+    const rest = this.pending
+    this.pending = ""
+    // onFrame 可能又扣下 rest（rest 自身以半截占位符结尾），故最后再 release 一次
+    return (rest ? this.onFrame(rest) : "") + this.release()
+  }
+
+  // 还原全部字符串字段后按原帧结构回写
+  private rebuild(lines: string[], lineIndex: number, obj: any): string {
+    walkStrings(obj, (v) => {
+      const r = rehydrate(v)
+      if (r !== v) this.rewrites++
+      return r
+    })
+    return sseBuildFrame(lines, lineIndex, obj)
+  }
+
+  private release(): string {
+    const h = this.held
+    this.held = null
+    if (!h) return ""
+    // 放弃拼接（流结束/本帧非延续）：把半截文本原样带回，绝不丢字节
+    setAtPath(h.obj, h.path, h.head + h.partial)
+    return this.rebuild(h.lines, h.lineIndex, h.obj)
+  }
+
+  // 找一个以"疑似未完成占位符前缀"结尾的字符串字段
+  private findPartial(obj: any): { path: string[]; head: string; partial: string } | null {
+    const box: { v: { path: string[]; head: string; partial: string } | null } = { v: null }
+    walkStrings(obj, (v, path) => {
+      if (box.v) return v
+      const pl = ssePartialLen(v)
+      if (pl > 0) box.v = { path, head: v.slice(0, v.length - pl), partial: v.slice(v.length - pl) }
+      return v
+    })
+    return box.v
+  }
+
+  private onFrame(frame: string): string {
+    // 快速路径：无被扣帧且帧内没有左方括号 → 不可能含占位符，逐字节透传（省 CPU，也保证无占位符流字节不变）
+    if (!this.held && frame.indexOf("[") < 0) return frame
+    const p = sseParseFrame(frame)
+    if (!p) return this.release() + frame // 非 JSON 帧（结束哨兵/event 行等）：先冲出被扣帧再原样透传
+    const obj = p.obj
+
+    if (this.held) {
+      const prev = getAtPath(obj, this.held.path)
+      if (typeof prev === "string") {
+        // 本帧同路径续上了 → 拼接后还原；被扣帧（其字段已剥掉半截）先发出
+        const held = this.held
+        const out = this.rebuild(held.lines, held.lineIndex, held.obj)
+        const combined = held.partial + prev
+        const pl = ssePartialLen(combined)
+        if (pl > 0) {
+          // 仍未完成：本帧继续扣住，半截文本累积
+          const head = combined.slice(0, combined.length - pl)
+          setAtPath(obj, held.path, head)
+          this.held = { obj, lines: p.lines, lineIndex: p.lineIndex, path: held.path, head, partial: combined.slice(combined.length - pl) }
+          return out
+        }
+        setAtPath(obj, held.path, rehydrate(combined))
+        this.held = null
+        return out + this.rebuild(p.lines, p.lineIndex, obj)
+      }
+      // 本帧没有同路径内容 → 不是延续，被扣帧原样冲出，再按新帧处理
+      const out = this.release()
+      const tail = this.findPartial(obj)
+      if (tail) {
+        setAtPath(obj, tail.path, tail.head)
+        this.held = { obj, lines: p.lines, lineIndex: p.lineIndex, path: tail.path, head: tail.head, partial: tail.partial }
+        return out
+      }
+      return out + this.rebuild(p.lines, p.lineIndex, obj)
+    }
+
+    const tail = this.findPartial(obj)
+    if (tail) {
+      // 扣帧：暂不发出，等下一帧续上（已剥掉半截文本，留在 head）
+      setAtPath(obj, tail.path, tail.head)
+      this.held = { obj, lines: p.lines, lineIndex: p.lineIndex, path: tail.path, head: tail.head, partial: tail.partial }
+      return ""
+    }
+    return this.rebuild(p.lines, p.lineIndex, obj)
+  }
+}
+
+// 把 ReadableStream 逐块过 SseRehydrator；任何异常都不向外抛（不污染回复）：
+// 能读到多少就冲出多少，上游中断后剩余字节随之丢弃（已缓冲部分不丢）。
+// 注意：必须用 start 里的读循环，不能用 pull——pull 若本次未 enqueue（例如首块不含完整帧）会被判定无进展，
+// 在部分运行时不再重入，流会永久停住（实测）。
+function sseRehydrateStream(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+  const reader = body.getReader()
+  const dec = new TextDecoder()
+  const enc = new TextEncoder()
+  const r = new SseRehydrator()
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          const out = r.push(dec.decode(value, { stream: true }))
+          if (out) controller.enqueue(enc.encode(out))
+        }
+        const buffered = dec.decode()
+        let tail = buffered ? r.push(buffered) : ""
+        tail += r.flush()
+        if (tail) controller.enqueue(enc.encode(tail))
+      } catch (e) {
+        // 上游流中断（ECONNRESET 等）后 reader 已进入错误态，再 read() 只会立刻抛同一个异常，
+        // 剩余字节无从读取；此处把已缓冲内容照常冲出，尽量少丢，且绝不把异常抛给调用方
+        console.error(`[sensitive-filter] SSE 还原中断，已缓冲内容照常冲出: ${e}`)
+        try {
+          const buffered = dec.decode()
+          let tail = buffered ? r.push(buffered) : ""
+          tail += r.flush()
+          if (tail) controller.enqueue(enc.encode(tail))
+        } catch { /* ignore */ }
+      }
+      try { controller.close() } catch { /* ignore */ }
+    },
+    cancel(reason) { try { void reader.cancel(reason) } catch { /* ignore */ } },
+  })
+}
+
 async function rehydrateHttpResponseV2(event: any): Promise<void> {
   try {
     const res = event?.response
@@ -808,9 +1051,18 @@ async function rehydrateHttpResponseV2(event: any): Promise<void> {
     let ct = ""
     try { ct = res.headers?.get?.("content-type") ?? "" } catch { ct = "" }
     if (/^(image|audio|video)\//i.test(ct) || /octet-stream/i.test(ct)) return
-    // 流式(SSE)：整段缓冲会破坏逐 token 输出，且逐 chunk 文本改写对含换行/引号的真值不安全。
-    // 这里直接放行，保持流式 UX 不变（代价：流式回复里占位符保持原样，必要时用 CLI --restore 还原）。
-    if (/text\/event-stream/i.test(ct)) return
+    // 流式(SSE)：逐帧 JSON 还原 + 跨帧扣帧（见上方说明）；SF_SSE_REHYDRATE=0 可整段放行
+    if (/text\/event-stream/i.test(ct)) {
+      if (process.env.SF_SSE_REHYDRATE === "0" || !res.body) return
+      const hs = new Headers(res.headers)
+      hs.delete("content-length")
+      hs.delete("content-encoding")
+      hs.delete("transfer-encoding")
+      event.response = new Response(sseRehydrateStream(res.body), {
+        status: res.status, statusText: res.statusText, headers: hs,
+      })
+      return
+    }
     let txt = ""
     try { txt = await res.clone().text() } catch { return }
     if (!txt || !TOKEN_HAS.test(txt)) return
@@ -913,5 +1165,7 @@ export default Object.assign(
     maskBatch,
     makeSep,
     renumber,
+    SseRehydrator,
+    sseRehydrateStream,
   },
 )
