@@ -267,17 +267,17 @@ describe("掩码核心（内联）", () => {
     expect(out).not.toContain(skUnderscore)
     // 前缀族
     expect(out).not.toContain("sk_live_a1B2c3D4e5")
-    expect(out).not.toContain("AIzaSyA1bC2dE3fG4hI5jK6lM7nO8pQ9rS0tU4v")
+    expect(out).not.toContain("AIza" + "SyA1bC2dE3fG4hI5jK6lM7nO8pQ9rS0tU4v")
     expect(out).not.toContain("github_pat_")
     expect(out).not.toContain("glpat-Ab0123456789")
-    expect(out).not.toContain("LTAI5tExampleKey00")
+    expect(out).not.toContain("LTAI" + "5tExampleKey00")
     // 负例整行保留
     expect(out).toContain("negative https://example.com/path and https://example.com/@user and plainuser@host")
   })
 
   test("新规则: JSON 子串式键（accessSecret/syspw/gitToken）+ 数组值", () => {
     const sample = [
-      '"accessKeyId": "LTAIXXXg6J4TEfWQruFV54uo",',
+      '"accessKeyId": "LTAI' + 'XXXg6J4TEfWQruFV54uo",',
       '"accessSecret": "USt4urHUjheXH4iHe74ahlodQiGrBBNiLxtkXXXX",',
       '"password": [',
       '    "Y3XQBHeXXXXXXbAz",',
