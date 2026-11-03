@@ -84,6 +84,14 @@ function ipv4Ok(s) {
   return !isPrivate
 }
 
+function hostOk(s) {
+  // 主机名内嵌 IPv4（如 jdboxsz-<ip>）整体掩码前，按末尾 IP 复用 ipv4Ok 的私网豁免策略。
+  // 背景：只掩 IP 会留下可读前缀 + 编号（形如 jdboxsz-[IPV4_n]），模型会把它缩写成 "sz-64" 这类
+  // 伪主机名，且无占位符可还原。整段掩码从根上消除可比对的锚点。
+  const m = /(\d{1,3}(?:\.\d{1,3}){3})$/.exec(s)
+  return m ? ipv4Ok(m[1]) : true
+}
+
 // ---------------------------------------------------------------- C 层规则
 // 顺序即优先级：先命中的 span 占位，后续类别跳过重叠区域。
 // 元组: [类别名, 正则, 校验函数|null, 要掩码的 group 序号]
@@ -128,6 +136,7 @@ const CATS = [
   ["phone", /(?<!\d)1[3-9]\d{9}(?!\d)/g, null, 0],
   ["bankcard", /(?<!\d)\d{16,19}(?!\d)/g, luhnOk, 0],
   ["email", /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, null, 0],
+  ["ipv4", /(?<![A-Za-z0-9_.-])[A-Za-z][A-Za-z0-9_.]*(?:-[A-Za-z0-9_.]+)*-(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}(?![\d.])/g, hostOk, 0],  // host-<ip> 整体掩码
   ["ipv4", /(?<![\d.])(?<![A-Za-z0-9]\/)((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])/g, ipv4Ok, 0],
 ]
 
@@ -485,6 +494,18 @@ function runSelfTest() {
     ["SF_MASK_PRIVATE_IP=1 私网掩码", privateMasked],
     ["SF_MASK_VALUES 自定义值掩码(777777→SECRET)", valuesMasked],
     ["SF_MASK_KEYS 自定义键掩值/键保留(pss=abc123)", keysMasked],
+  )
+  // host-<ip> 整体掩码（防模型把 host-<ip> 整体掩码后缩写成 "sz-64" 这类无映射伪名）
+  const pubIp = "203" + ".0" + ".113" + ".9" // RFC 5737 文档段
+  const hostname = "jdboxsz-" + pubIp
+  const h = maskText("node " + hostname, new Set(CATS.map((c) => c[0])), false)
+  const privHost = "host-" + "192" + ".168" + ".1" + ".1"
+  const ph = maskText("h " + privHost, new Set(CATS.map((c) => c[0])), false)
+  checks.push(
+    ["host-<ip> 整体掩码(不留可缩写的可读前缀)",
+      !h.out.includes(hostname) && !h.out.includes("jdboxsz-") && h.out.startsWith("node [IPV4_") &&
+      (h.sess.mapping[hostname] || "").startsWith("[IPV4_")],
+    ["私网 host-<ip> 同独立 IP 策略豁免", ph.out.includes(privHost)],
   )
   let ok = true
   for (const [name, passed] of checks) {

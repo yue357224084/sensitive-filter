@@ -240,6 +240,25 @@ describe("掩码核心（内联）", () => {
     }
   })
 
+  test("新规则: host-<ip> 整体掩码（防模型缩写成 sz-64 类伪名）", () => {
+    // 只掩 IP 时模型看到 "jdboxsz-183.131.35.94"，会缩成 "sz-64"：无占位符、无法还原。
+    // 整段掩码后连可读前缀都不给模型，从根上消除缩写的锚点。
+    const pub = "203.0.113." + "9"          // RFC 5737 文档段（不豁免）
+    const name = "jdboxsz-" + pub
+    const { out, sess } = maskText("node " + name + " load 59", allCats(), false)
+    expect(out).toMatch(/^node \[IPV4_\d+\] load 59$/)
+    expect(out).not.toContain("jdboxsz-")
+    expect(sess.mapping[name]).toMatch(/^\[IPV4_\d+\]$/)
+    // 多级/多段前缀、ssh 形式、端口后缀一并覆盖
+    const multi = "app.example.com-" + pub + ":8080"
+    expect(maskText("x " + multi, allCats(), false).out).not.toContain("app.example.com-")
+    // 私网内嵌主机名与独立私网 IP 同策略（默认豁免）
+    const priv = "host-" + "192.168.1." + "1"
+    expect(maskText("h " + priv, allCats(), false).out).toContain(priv)
+    // 负例: 日期/版本号/裸 IP 不带 "-" 前缀 → 仍走普通 ipv4 规则（此处日期保留）
+    expect(maskText("d 2026-11-02", allCats(), false).out).toBe("d 2026-11-02")
+  })
+
   test("新规则: URL userinfo / JSON 引号键 / sk_ 下划线 / 云厂商前缀", () => {
     const skUnderscore = "sk_" + "b" + "0".repeat(63)
     const sample = [

@@ -96,6 +96,16 @@ def ipv4_ok(s: str) -> bool:
     return not is_private
 
 
+def host_ok(s: str) -> bool:
+    """主机名内嵌 IPv4（如 jdboxsz-<ip>）整体掩码前，按末尾 IP 复用 ipv4_ok 的私网豁免策略。
+
+    背景：只掩 IP 会留下可读前缀 + 编号（形如 jdboxsz-[IPV4_n]），模型会把它缩写成
+    "sz-64" 这类伪主机名，且无占位符可还原。整段掩码从根上消除可比对的锚点。
+    返回 False 时不掩码（主机名内的私网 IP 与独立私网 IP 同策略），其后 ipv4 规则同样跳过。
+    """
+    m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})$", s)
+    return ipv4_ok(m.group(1)) if m else True
+
 # ---------------------------------------------------------------- C 层规则
 # 顺序即优先级：先命中的 span 占位，后续类别跳过重叠区域。
 # 元组: (类别名, 正则, 校验函数|None, 要掩码的 group 序号)
@@ -138,6 +148,7 @@ _CATS = [
     ("phone", r"(?<!\d)1[3-9]\d{9}(?!\d)", None, 0),
     ("bankcard", r"(?<!\d)\d{16,19}(?!\d)", luhn_ok, 0),
     ("email", r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", None, 0),
+    ("ipv4", r"(?<![A-Za-z0-9_.-])[A-Za-z][A-Za-z0-9_.]*(?:-[A-Za-z0-9_.]+)*-(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}(?![\d.])", host_ok, 0),  # host-<ip> 整体掩码
     ("ipv4", r"(?<![\d.])(?<![A-Za-z0-9]\/)((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])", ipv4_ok, 0),
 ]
 
@@ -445,6 +456,19 @@ def run_selftest() -> int:
         ("SF_MASK_PRIVATE_IP=1 私网掩码", private_masked),
         ("SF_MASK_VALUES 自定义值掩码(777777→SECRET)", values_masked),
         ("SF_MASK_KEYS 自定义键掩值/键保留(pss=abc123)", keys_masked),
+    ]
+
+    # host-<ip> 整体掩码（防模型把 jdboxsz-<ip> 整体掩码后缩写成 "sz-64" 这类无映射伪名）
+    pub_ip = "203" + ".0" + ".113" + ".9"   # RFC 5737 文档段
+    hostname = "jdboxsz-" + pub_ip
+    h_out, h_sess, _ = mask_text("node " + hostname, {c for c, *_ in _CATS}, use_gitleaks=False)
+    priv_host = "host-" + "192" + ".168" + ".1" + ".1"
+    ph_out, _, _ = mask_text("h " + priv_host, {c for c, *_ in _CATS}, use_gitleaks=False)
+    checks += [
+        ("host-<ip> 整体掩码(不留可缩写的可读前缀)",
+         hostname not in h_out and "jdboxsz-" not in h_out and h_out.startswith("node [IPV4_")
+         and h_sess.mapping.get(hostname, "").startswith("[IPV4_")),
+        ("私网 host-<ip> 同独立 IP 策略豁免", priv_host in ph_out),
     ]
     ok = True
     for name, passed in checks:

@@ -25,7 +25,7 @@ Run logs/config/code before pasting them into a cloud LLM (or your chat context)
 | 手机号 Phone | 中国大陆手机号 |
 | 银行卡 Bank card | Luhn 校验位验证（误报极低） |
 | 邮箱 Email | 通用邮箱格式 |
-| IPv4 | 点分十进制；内网段（10/8、172.16/12、192.168/16、127/8、169.254/16、100.64/10 CGNAT）默认豁免，`SF_MASK_PRIVATE_IP=1` 恢复掩码；RFC 5737 保留段不豁免 |
+| IPv4 | 点分十进制；内网段（10/8、172.16/12、192.168/16、127/8、169.254/16、100.64/10 CGNAT）默认豁免，`SF_MASK_PRIVATE_IP=1` 恢复掩码；RFC 5737 保留段不豁免。内嵌 IP 的主机名（`host-<ip>`、`a.b-<ip>:port`）整段作为一个 IPv4 类占位符掩码（私网内嵌与独立 IP 同策略豁免），避免留下可读前缀 + 编号让模型缩写成 `sz-64` 这类无映射伪名 |
 
 输出可逆：脱敏为 `[SECRET_2]`/`[IDCARD_1]`/`[PHONE_1]`/`[BANKCARD_1]`/`[EMAIL_1]`/`[IPV4_1]` 形占位符，映射文件仅存本地，LLM 返回后 `--restore` 回填。映射文件名与内容 sha256 绑定，防错配；超过上限自动清理（默认保留 5000 个，从最旧删）。
 

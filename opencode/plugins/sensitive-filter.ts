@@ -60,7 +60,7 @@ const TOKEN_HAS = /\[(?:SECRET|IDCARD|PHONE|BANKCARD|EMAIL|IPV4)_\d+\]/
 const TOKEN_ANY = /\[(?:SECRET|IDCARD|PHONE|BANKCARD|EMAIL|IPV4)_\d+\]/g
 
 const SF_INSTRUCTION =
-  "[sensitive-filter] 对话里的 [SECRET_n]/[IDCARD_n]/[PHONE_n]/[BANKCARD_n]/[EMAIL_n]/[IPV4_n] 是真实值的本地脱敏占位符：请原样保留引用、不要改写格式、不要编造原值；在 bash/写文件等工具参数里引用时也保持原样（工具执行前会自动还原为真值）。占位符编号只是本地掩码序号，与真实值没有任何数值关系（编号 n 并非对应真实 IP 的末段，也不代表任何真实数据的一部分）：严禁剥掉占位符只保留编号、或把编号拼进主机名/标识符（如把 app-[IPV4_n] 写成 app-123）——这类写法无法还原，会把错误值展示给用户。需要可读的主机/对象标识时，保留完整占位符（如 app-[IPV4_n]），展示层会自动还原为真实值。给文件/目录命名时不要引用占位符或其编号（如 ipv4_41），用语义字段（如 zid、日期）命名。"
+  "[sensitive-filter] 对话里的 [SECRET_n]/[IDCARD_n]/[PHONE_n]/[BANKCARD_n]/[EMAIL_n]/[IPV4_n] 是真实值的本地脱敏占位符：请原样保留引用、不要改写格式、不要编造原值；在 bash/写文件等工具参数里引用时也保持原样（工具执行前会自动还原为真值）。一个占位符可能代表一整台主机名或完整标识（如 jdboxsz-<ip>、app.example.com-<ip>:8080 都被整体替换为一个 [IPV4_n]）：不要补任何前缀/后缀、不要拆分、不要把编号当成 IP 末段或其它真实字段；占位符编号只是本地掩码序号，与真实值没有任何数值关系。严禁剥掉占位符只保留编号、或把编号拼进主机名/标识符（如把 183.131.35.94 写成 sz-64、把 app-[IPV4_n] 写成 app-123）——这类写法无法还原，会把错误值展示给用户。给文件/目录命名时不要引用占位符或其编号（如 ipv4_41），用语义字段（如 zid、日期）命名。"
 
 // opencode 插件加载约束：模块顶层每个导出值必须是函数（getLegacyPlugins 遍历 Object.values(mod)，
 // 数组/对象导出直接抛 "Plugin export is not a function"，具名函数导出会被误当插件实例调用）。
@@ -247,6 +247,14 @@ function ipv4Ok(s: string): boolean {
   return !isPrivate
 }
 
+function hostOk(s: string): boolean {
+  // 主机名内嵌 IPv4（如 jdboxsz-<ip>）整体掩码前，按末尾 IP 复用 ipv4Ok 的私网豁免策略。
+  // 背景：只掩 IP 会留下可读前缀 + 编号（形如 jdboxsz-[IPV4_n]），模型会把它缩写成 "sz-64" 这类
+  // 伪主机名，且无占位符可还原。整段掩码从根上消除可比对的锚点。
+  const m = /(\d{1,3}(?:\.\d{1,3}){3})$/.exec(s)
+  return m ? ipv4Ok(m[1]) : true
+}
+
 // ---- C 层规则 ----
 // 顺序即优先级：先命中的 span 占位，后续类别跳过重叠区域。
 // 元组: [类别名, 正则, 校验函数|null, 要掩码的 group 序号]
@@ -291,6 +299,7 @@ const CATS: [string, RegExp, ((s: string) => boolean) | null, number][] = [
   ["phone", /(?<!\d)1[3-9]\d{9}(?!\d)/g, null, 0],
   ["bankcard", /(?<!\d)\d{16,19}(?!\d)/g, luhnOk, 0],
   ["email", /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, null, 0],
+  ["ipv4", /(?<![A-Za-z0-9_.-])[A-Za-z][A-Za-z0-9_.]*(?:-[A-Za-z0-9_.]+)*-(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}(?![\d.])/g, hostOk, 0],  // host-<ip> 整体掩码（防模型缩写为 sz-64 类伪名）
   ["ipv4", /(?<![\d.])(?<![A-Za-z0-9]\/)((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])/g, ipv4Ok, 0],
 ]
 

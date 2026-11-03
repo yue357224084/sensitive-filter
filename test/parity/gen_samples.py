@@ -141,6 +141,7 @@ if __name__ == "__main__":
         f"mail1={fake_mail1} mail2={fake_mail2}\n"
         f"ip1={ip1} ip2={ip2} ip3={ip3}\n"
         f"ip4={ip4} ip5={ip5} ip6={ip6} (private, exempt by default)\n"
+        f"host1=jdboxsz-{ip3} host2=ssh web-{ip2}:8080 host3=host-{ip4} (private, exempt)\n"
         f"pss={custom_literal} v={custom_literal}\n"
         f"sk1={sk(32)} sk2={pk(32)}\n"
         f"ghp={ghp(40)} xox={xox(20)} akia=AKIAIOSFODNN7EXAMPLE\n"
